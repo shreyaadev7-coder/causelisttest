@@ -1,0 +1,52 @@
+name: Generate Daily Karnataka HC Cause List
+
+on:
+  schedule:
+    # 13:00 UTC = 18:30 IST (Monday through Friday)
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch: # Allows manual run button in GitHub UI
+
+jobs:
+  scrape_and_export:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run Scraper & LLM Parser
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python run.py
+
+      - name: Upload Excel Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: cause-list-${{ github.run_id }}
+          path: cause_list.xlsx
+          retention-days: 30
+
+      - name: Commit and Push to Repository (Optional)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p output
+          mv cause_list.xlsx output/cause_list_$(date +'%Y-%m-%d').xlsx
+          git add output/
+          git commit -m "Add cause list for $(date +'%Y-%m-%d')" || exit 0
+          git push
