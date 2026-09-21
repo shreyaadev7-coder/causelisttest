@@ -2,6 +2,7 @@ name: Generate Daily Karnataka HC Cause List
 
 on:
   schedule:
+    # 13:00 UTC = 18:30 IST (Monday to Friday)
     - cron: '0 13 * * 1-5'
   workflow_dispatch:
 
@@ -33,7 +34,7 @@ jobs:
         run: |
           python run.py
 
-      - name: Upload Artifacts (Excel & Error Screenshots)
+      - name: Upload Output Artifacts (Success or Fail)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -42,5 +43,6 @@ jobs:
             cause_list.xlsx
             causelist.pdf
             failure.png
-            captcha.png
-          retention-days: 7
+            page_dump.html
+          if-no-files-found: ignore
+          retention-days: 14
