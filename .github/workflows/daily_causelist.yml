@@ -2,6 +2,7 @@ name: Generate Daily Karnataka HC Cause List
 
 on:
   schedule:
+    # 13:00 UTC = 18:30 IST (Monday to Friday)
     - cron: '0 13 * * 1-5'
   workflow_dispatch:
 
@@ -27,7 +28,7 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run Scraper & LLM Parser
+      - name: Run Scraper & Formatter
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
@@ -41,10 +42,7 @@ jobs:
           name: cause-list-results-${{ github.run_id }}
           path: |
             cause_list.xlsx
+            cause_list_summary.pdf
             causelist.pdf
-            00_initial_page.png
-            01_form_filled.png
-            02_search_results.png
-            03_print_view.png
           if-no-files-found: ignore
           retention-days: 14
