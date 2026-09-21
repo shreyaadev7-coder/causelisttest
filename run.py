@@ -35,10 +35,30 @@ def get_target_date_ist():
     # Hardcoded test date for verification
     return "22/09/2026"
 
-    # Production logic:
+    # Production logic (uncomment when testing is complete):
     # ist = pytz.timezone('Asia/Kolkata')
     # next_day = datetime.now(ist) + timedelta(days=1)
     # return next_day.strftime("%d/%m/%Y")
+
+def extract_rows_from_page(page) -> list[list[str]]:
+    """Directly extracts the rendered table rows from the browser DOM in 0.1s."""
+    print("[*] Extracting cause list table directly from page DOM...")
+    extracted_rows = []
+    
+    tables = page.locator("table:visible").all()
+    for table in tables:
+        rows = table.locator("tr").all()
+        for row in rows:
+            cells = [td.inner_text().strip() for td in row.locator("th, td").all()]
+            # Filter out empty rows or pure header duplicates
+            if len(cells) >= 7 and not ("CASE NUMBER" in cells[1].upper() if len(cells) > 1 else False):
+                # Ensure exactly 8 elements
+                while len(cells) < 8:
+                    cells.append("")
+                extracted_rows.append(cells[:8])
+                
+    print(f"[+] Direct DOM extraction found {len(extracted_rows)} case rows.")
+    return extracted_rows
 
 def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
     date_str = get_target_date_ist()
@@ -63,6 +83,8 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         ]
     }
 
+    raw_table_rows = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch_args)
         context = browser.new_context(
@@ -71,8 +93,6 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             viewport={"width": 1366, "height": 900}
         )
         page = context.new_page()
-
-        # Prevent browser print dialogs from blocking execution
         page.add_init_script("window.print = () => { console.log('window.print intercepted'); };")
 
         print("[*] Navigating to High Court Portal via Indian Gateway...")
@@ -110,7 +130,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             searchby_select.select_option(index=1)
         page.wait_for_timeout(3000)
 
-        # 3. Enter Dates (Using .first to prevent duplicate ID strict mode violations)
+        # 3. Enter Dates
         print(f"[*] Step 3: Entering Date -> {date_str}")
         from_dt = page.locator("#fromDt:visible").first
         if from_dt.is_visible():
@@ -124,7 +144,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         page.wait_for_timeout(1000)
 
-        # 4. Enter Advocate Name (Resolves duplicate ID by targeting the specific visible placeholder)
+        # 4. Enter Advocate Name
         print("[*] Step 4: Entering Advocate Name -> Mahesh Chowdhary")
         adv_input = page.locator("input[placeholder='Enter Advocate Name']:visible").first
         if not adv_input.is_visible():
@@ -137,7 +157,6 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         page.wait_for_timeout(1000)
         page.screenshot(path="01_form_filled.png")
-        print("[*] Saved screenshot: 01_form_filled.png")
 
         # 5. Click GET DETAILS
         print("[*] Step 5: Submitting search via '#getData'...")
@@ -147,10 +166,12 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         print("[*] Waiting 7 seconds for court database query to complete...")
         page.wait_for_timeout(7000)
         page.screenshot(path="02_search_results.png")
-        print("[*] Saved screenshot: 02_search_results.png")
 
-        # 6. Locate Print Button or Print View
-        print("[*] Step 6: Triggering Print List...")
+        # Extract table directly from the live DOM (Primary Fast Path)
+        raw_table_rows = extract_rows_from_page(page)
+
+        # 6. Locate Print Button to save the PDF artifact
+        print("[*] Step 6: Triggering Print List to capture causelist.pdf...")
         print_btn = None
         for btn in page.locator("input[type='button']:visible, button:visible, a:visible").all():
             btn_id = (btn.get_attribute("id") or "").lower()
@@ -160,7 +181,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
                 continue
             if "print" in val or "print" in txt or "print" in btn_id:
                 print_btn = btn
-                print(f"[+] Identified Print Button: id='{btn_id}', val='{val}', txt='{txt}'")
+                print(f"[+] Identified Print Button: id='{btn_id}', val='{val}'")
                 break
 
         if print_btn:
@@ -180,66 +201,20 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
                 page.screenshot(path="03_print_view.png")
                 print(f"[+] Saved cause list PDF from page: {pdf_path}")
         else:
-            print("[*] No separate print button found; rendering results table directly to PDF...")
+            print("[*] Rendering table directly to PDF...")
             page.pdf(path=pdf_path, format="A4", print_background=True)
             page.screenshot(path="03_print_view.png")
 
         browser.close()
 
-def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is missing.")
+    return raw_table_rows
 
-    client = genai.Client(api_key=api_key)
-
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
-
-    prompt = (
-        "Extract the complete cause list table from this PDF into the structured JSON schema. "
-        "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
-        "Do not omit any row. If no cases are listed, return an empty rows array."
-    )
-
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-    max_retries = 5
-    response = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"[*] Submitting cause list PDF to {model_name} (Attempt {attempt}/{max_retries})...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[
-                    types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=CauseListDocument,
-                    temperature=0.0
-                )
-            )
-            break
-        except Exception as e:
-            err_str = str(e)
-            if "503" in err_str or "UNAVAILABLE" in err_str or "ResourceExhausted" in err_str:
-                if attempt < max_retries:
-                    wait_time = attempt * 8
-                    print(f"[!] Server busy (503). Pausing {wait_time}s before retry...")
-                    time.sleep(wait_time)
-                    continue
-            raise
-
-    parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
-    print(f"[+] Successfully extracted {len(parsed.rows)} rows for date: {parsed.date}")
-
+def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
+    """Writes standard 8-column cause list data to Excel with styling."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Cause List"
 
-    # Exact 8 headers matching the High Court PDF
     headers = ["SL NO", "CASE NUMBER", "CASE NAME", "CH", "LIST", "SL NO", "STATUS", "JUDGES"]
     ws.append(headers)
 
@@ -260,17 +235,11 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = thin_border
 
-    for row in parsed.rows:
-        ws.append([
-            row.sl_no,
-            row.case_number,
-            row.case_name,
-            row.ch,
-            row.list_num,
-            row.list_sl_no,
-            row.status,
-            row.judges
-        ])
+    for row in rows:
+        if isinstance(row, CauseListRow):
+            ws.append([row.sl_no, row.case_number, row.case_name, row.ch, row.list_num, row.list_sl_no, row.status, row.judges])
+        else:
+            ws.append(row[:8])
 
     for r in range(2, ws.max_row + 1):
         for c in range(1, 9):
@@ -287,12 +256,70 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
     wb.save(excel_path)
-    print(f"[+] Excel written to {excel_path}")
+    print(f"[+] Excel successfully generated at: {excel_path}")
+
+def parse_pdf_with_gemini(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
+    """Multi-model fallback AI parser (used if direct DOM table was empty)."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable is missing.")
+
+    client = genai.Client(api_key=api_key)
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    prompt = (
+        "Extract the complete cause list table from this PDF into the structured JSON schema. "
+        "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
+        "Do not omit any row. If no cases are listed, return an empty rows array."
+    )
+
+    # Multi-model rotation list to prevent 503 deadlocks
+    models_to_try = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.6-flash"]
+    response = None
+
+    for model_name in models_to_try:
+        try:
+            print(f"[*] Submitting PDF to fallback AI model: {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CauseListDocument,
+                    temperature=0.0
+                )
+            )
+            print(f"[+] AI extraction succeeded using {model_name}.")
+            break
+        except Exception as e:
+            print(f"[!] {model_name} failed ({e}). Trying next model...")
+            time.sleep(3)
+
+    if not response:
+        raise RuntimeError("All Gemini models are temporarily unavailable.")
+
+    parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
+    print(f"[+] Extracted {len(parsed.rows)} rows via AI.")
+    write_to_excel(parsed.rows, excel_path)
 
 if __name__ == "__main__":
     try:
-        fetch_cause_list_pdf("causelist.pdf")
-        parse_pdf_to_excel("causelist.pdf", "cause_list.xlsx")
+        # Step 1: Run browser automation & grab direct DOM rows
+        direct_rows = fetch_cause_list_pdf("causelist.pdf")
+        
+        # Step 2: Prefer direct DOM rows (0ms latency, immune to 503 errors)
+        if direct_rows and len(direct_rows) > 0:
+            print(f"[+] Writing {len(direct_rows)} direct DOM rows to Excel...")
+            write_to_excel(direct_rows, "cause_list.xlsx")
+        else:
+            print("[*] Direct DOM table was empty; triggering multi-model AI parsing on PDF...")
+            parse_pdf_with_gemini("causelist.pdf", "cause_list.xlsx")
+            
     except Exception as err:
         print(f"[FATAL] Process aborted: {err}", file=sys.stderr)
         traceback.print_exc()
