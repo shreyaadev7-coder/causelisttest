@@ -31,10 +31,11 @@ jobs:
       - name: Run Scraper & LLM Parser
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: |
           python run.py
 
-      - name: Upload Output Artifacts (Success or Fail)
+      - name: Upload Output Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -42,7 +43,5 @@ jobs:
           path: |
             cause_list.xlsx
             causelist.pdf
-            failure.png
-            page_dump.html
           if-no-files-found: ignore
           retention-days: 14
