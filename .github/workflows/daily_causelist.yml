@@ -2,9 +2,8 @@ name: Generate Daily Karnataka HC Cause List
 
 on:
   schedule:
-    # 13:00 UTC = 18:30 IST (Monday through Friday)
     - cron: '0 13 * * 1-5'
-  workflow_dispatch: # Allows manual run button in GitHub UI
+  workflow_dispatch:
 
 jobs:
   scrape_and_export:
@@ -34,19 +33,14 @@ jobs:
         run: |
           python run.py
 
-      - name: Upload Excel Output
+      - name: Upload Artifacts (Excel & Error Screenshots)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cause-list-${{ github.run_id }}
-          path: cause_list.xlsx
-          retention-days: 30
-
-      - name: Commit and Push to Repository (Optional)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          mkdir -p output
-          mv cause_list.xlsx output/cause_list_$(date +'%Y-%m-%d').xlsx
-          git add output/
-          git commit -m "Add cause list for $(date +'%Y-%m-%d')" || exit 0
-          git push
+          name: cause-list-results-${{ github.run_id }}
+          path: |
+            cause_list.xlsx
+            causelist.pdf
+            failure.png
+            captcha.png
+          retention-days: 7
