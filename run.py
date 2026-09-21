@@ -73,6 +73,9 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         )
         page = context.new_page()
 
+        # Prevent browser print dialogs from freezing headless execution
+        page.add_init_script("window.print = () => { console.log('window.print called'); };")
+
         print("[*] Navigating to High Court Portal via Indian Gateway...")
         page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(3000)
@@ -80,7 +83,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         # 1. Bench Selection
         print("[*] Step 1: Selecting Bench -> Bengaluru Bench")
-        bench_select = page.locator("select:visible").first
+        bench_select = page.locator("select[name='bench']").first
         selected_bench = False
         for opt in bench_select.locator("option").all():
             opt_text = opt.inner_text().strip()
@@ -95,117 +98,74 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         # 2. Search By: Advocate
         print("[*] Step 2: Selecting Search By -> Advocate")
+        searchby_select = page.locator("select[name='searchby']").first
         selected_search_by = False
-        for sel in page.locator("select:visible").all():
-            for opt in sel.locator("option").all():
-                opt_text = opt.inner_text().strip()
-                if "Advocate" in opt_text:
-                    sel.select_option(label=opt_text)
-                    print(f"[+] Dropdown selected: '{opt_text}'")
-                    selected_search_by = True
-                    break
-            if selected_search_by:
+        for opt in searchby_select.locator("option").all():
+            opt_text = opt.inner_text().strip()
+            if "Advocate" in opt_text:
+                searchby_select.select_option(label=opt_text)
+                print(f"[+] Search By selected: '{opt_text}'")
+                selected_search_by = True
                 break
-
-        # Check for radio button if not a dropdown
         if not selected_search_by:
-            for r in page.locator("input[type='radio']:visible, label:has-text('Advocate')").all():
-                val = r.get_attribute("value") or ""
-                text = r.inner_text().strip() if hasattr(r, 'inner_text') else ""
-                if "adv" in val.lower() or "advocate" in text.lower():
-                    r.click()
-                    print(f"[+] Clicked Advocate radio button (value='{val}')")
-                    selected_search_by = True
-                    break
-
+            searchby_select.select_option(index=1)
         page.wait_for_timeout(3000)
 
-        # Print all visible inputs to the console for debugging
-        print("\n[*] --- Detected Visible Form Controls ---")
-        for inp in page.locator("input:visible, select:visible").all():
-            tag = inp.evaluate("el => el.tagName.toLowerCase()")
-            el_type = inp.get_attribute("type") or ""
-            el_id = inp.get_attribute("id") or ""
-            name = inp.get_attribute("name") or ""
-            ph = inp.get_attribute("placeholder") or ""
-            print(f"    <{tag} type='{el_type}' id='{el_id}' name='{name}' placeholder='{ph}'>")
-        print("[*] ----------------------------------------\n")
-
-        # 3. Enter Date into visible date inputs
+        # 3. Enter Dates using the exact field IDs from the log
         print(f"[*] Step 3: Entering Date -> {date_str}")
-        for inp in page.locator("input:visible").all():
-            el_type = (inp.get_attribute("type") or "").lower()
-            if el_type in ["hidden", "submit", "button", "radio", "checkbox"]:
-                continue
-            ph = (inp.get_attribute("placeholder") or "").lower()
-            name = (inp.get_attribute("name") or "").lower()
-            el_id = (inp.get_attribute("id") or "").lower()
-            cls = (inp.get_attribute("class") or "").lower()
-            
-            # Identify date input by placeholder, class, or name
-            if "dd/mm/yyyy" in ph or "datepicker" in cls or "date" in name or "date" in el_id or "dt" in name or "dt" in el_id:
-                inp.fill(date_str)
-                print(f"[+] Date set to '{date_str}' in <input id='{el_id}' name='{name}'>")
+        from_dt = page.locator("#fromDt")
+        if from_dt.is_visible():
+            from_dt.fill(date_str)
+            print(f"[+] #fromDt set to: '{date_str}'")
+
+        to_dt = page.locator("#toDt")
+        if to_dt.is_visible():
+            to_dt.fill(date_str)
+            print(f"[+] #toDt set to: '{date_str}'")
 
         page.wait_for_timeout(1000)
 
-        # 4. Enter Advocate Name
+        # 4. Enter Advocate Name using exact #advName ID
         print("[*] Step 4: Entering Advocate Name -> Mahesh Chowdhary")
-        adv_input = None
-        
-        # Priority A: Check for input explicitly referencing advocate
-        for inp in page.locator("input:visible").all():
-            el_type = (inp.get_attribute("type") or "").lower()
-            if el_type in ["hidden", "submit", "button", "radio", "checkbox"]:
-                continue
-            ph = (inp.get_attribute("placeholder") or "").lower()
-            name = (inp.get_attribute("name") or "").lower()
-            el_id = (inp.get_attribute("id") or "").lower()
-            
-            if ("adv" in name or "adv" in el_id or "adv" in ph) and ("dt" not in name and "date" not in name and "dd/mm/yyyy" not in ph):
-                adv_input = inp
-                break
-
-        # Priority B: First visible text input that is not a date field
-        if not adv_input:
-            for inp in page.locator("input[type='text']:visible, input:not([type]):visible").all():
-                ph = (inp.get_attribute("placeholder") or "").lower()
-                name = (inp.get_attribute("name") or "").lower()
-                el_id = (inp.get_attribute("id") or "").lower()
-                if "dd/mm/yyyy" not in ph and "date" not in name and "dt" not in name and "dt" not in el_id:
-                    adv_input = inp
-                    break
-
-        if adv_input:
+        adv_input = page.locator("#advName")
+        if adv_input.is_visible():
             adv_input.fill("Mahesh Chowdhary")
-            print(f"[+] Advocate Name verified in field: '{adv_input.input_value()}'")
+            print(f"[+] #advName verified: '{adv_input.input_value()}'")
         else:
-            print("[FATAL] Could not isolate Advocate Name input box!")
+            # Fallback if ID changed
+            page.locator("input[placeholder*='Advocate']:visible").first.fill("Mahesh Chowdhary")
 
         page.wait_for_timeout(1000)
         page.screenshot(path="01_form_filled.png")
         print("[*] Saved screenshot: 01_form_filled.png")
 
-        # 5. Click GET DETAILS
-        print("[*] Step 5: Submitting search via 'GET DETAILS'...")
-        get_btn = page.locator("input[value*='GET DETAILS' i]:visible, button:has-text('GET DETAILS'):visible, input[value*='DETAILS' i]:visible, button:has-text('DETAILS'):visible").first
-        if get_btn.is_visible():
-            get_btn.click()
-        else:
-            page.locator("input[type='submit']:visible, button[type='submit']:visible").first.click()
+        # 5. Click GET DETAILS using exact #getData ID
+        print("[*] Step 5: Submitting search via '#getData'...")
+        page.locator("#getData").click()
 
-        print("[*] Waiting 6 seconds for High Court database results...")
+        print("[*] Waiting 6 seconds for database results...")
         page.wait_for_timeout(6000)
         page.screenshot(path="02_search_results.png")
         print("[*] Saved screenshot: 02_search_results.png")
 
-        # 6. Click PRINT LIST to generate the official printable view
-        print("[*] Step 6: Triggering 'PRINT LIST'...")
-        print_btn = page.locator("input[value*='PRINT' i]:visible, button:has-text('PRINT' i):visible").first
-        
-        if print_btn.is_visible():
+        # 6. Locate Print Button without invalid CSS syntax
+        print("[*] Step 6: Locating Print Button...")
+        print_btn = None
+        for btn in page.locator("input[type='button']:visible, button:visible").all():
+            btn_id = (btn.get_attribute("id") or "").lower()
+            val = (btn.get_attribute("value") or "").lower()
+            txt = (btn.inner_text() or "").lower()
+            if btn_id == "getdata":
+                continue
+            print(f"    Button found: id='{btn_id}', value='{val}', text='{txt}'")
+            if "print" in val or "print" in txt or "print" in btn_id:
+                print_btn = btn
+                break
+
+        if print_btn:
+            print("[+] Clicking Print button...")
             try:
-                with context.expect_page(timeout=12000) as popup_info:
+                with context.expect_page(timeout=6000) as popup_info:
                     print_btn.click()
                 print_page = popup_info.value
                 print_page.wait_for_load_state("domcontentloaded")
@@ -214,13 +174,13 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
                 print_page.screenshot(path="03_print_view.png")
                 print(f"[+] Captured cause list PDF via print window: {pdf_path}")
             except Exception as e:
-                print(f"[*] Popup wait finished ({e}). Rendering main page to PDF...")
+                print(f"[*] Print opened in-page or no popup ({e}). Rendering page to PDF...")
                 page.wait_for_timeout(2000)
                 page.pdf(path=pdf_path, format="A4", print_background=True)
                 page.screenshot(path="03_print_view.png")
-                print(f"[+] Saved cause list PDF: {pdf_path}")
+                print(f"[+] Saved cause list PDF from page: {pdf_path}")
         else:
-            print("[*] 'PRINT LIST' button not present; rendering results directly to PDF...")
+            print("[*] Rendering table directly to PDF...")
             page.pdf(path=pdf_path, format="A4", print_background=True)
             page.screenshot(path="03_print_view.png")
 
@@ -239,7 +199,7 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     prompt = (
         "Extract the complete cause list table from this PDF into the structured JSON schema. "
         "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
-        "Do not omit any row. If there are no cases listed, return an empty rows array."
+        "Do not omit any row. If no cases are listed, return an empty rows array."
     )
 
     model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
@@ -279,6 +239,7 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     ws = wb.active
     ws.title = "Cause List"
 
+    # Exact headers matching the High Court PDF
     headers = ["SL NO", "CASE NUMBER", "CASE NAME", "CH", "LIST", "SL NO", "STATUS", "JUDGES"]
     ws.append(headers)
 
