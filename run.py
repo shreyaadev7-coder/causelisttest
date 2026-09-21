@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import traceback
 from datetime import datetime, timedelta
 import pytz
@@ -10,9 +11,9 @@ from pydantic import BaseModel, Field
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# Define schema matching exact PDF columns
+# Schema strictly matching the High Court PDF columns
 class CauseListRow(BaseModel):
-    sl_no: str = Field(description="First SL NO column")
+    sl_no: str = Field(description="First SL NO column (overall serial)")
     case_number: str = Field(description="CASE NUMBER (e.g. WP NO 102709/2026)")
     case_name: str = Field(description="Full CASE NAME with parties and respondent notes")
     ch: str = Field(description="Court Hall number under CH")
@@ -25,21 +26,29 @@ class CauseListDocument(BaseModel):
     date: str = Field(description="Date displayed at top of cause list")
     rows: list[CauseListRow]
 
-def get_next_day_ist():
-    ist = pytz.timezone('Asia/Kolkata')
-    next_day = datetime.now(ist) + timedelta(days=1)
-    #return next_day.strftime("%d/%m/%Y")
+def get_target_date_ist():
+    # Check if manual date passed via GitHub Actions input
+    manual = os.environ.get("TEST_DATE")
+    if manual and manual.strip():
+        print(f"[*] Overriding date with TEST_DATE: {manual.strip()}")
+        return manual.strip()
+
+    # Hardcoded test date (set to 22/09/2026)
     return "22/09/2026"
 
+    # Production logic:
+    # ist = pytz.timezone('Asia/Kolkata')
+    # next_day = datetime.now(ist) + timedelta(days=1)
+    # return next_day.strftime("%d/%m/%Y")
+
 def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
-    date_str = get_next_day_ist()
-    print(f"[*] Target Causelist Date (IST): {date_str}")
+    date_str = get_target_date_ist()
+    print(f"[*] Target Causelist Date: {date_str}")
 
     scraperapi_key = os.environ.get("SCRAPERAPI_KEY")
     if not scraperapi_key:
-        raise ValueError("SCRAPERAPI_KEY environment variable is missing from GitHub Secrets.")
+        raise ValueError("SCRAPERAPI_KEY environment variable is missing.")
 
-    # Route Playwright through ScraperAPI's Indian gateway
     launch_args = {
         "headless": True,
         "proxy": {
@@ -60,66 +69,124 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         context = browser.new_context(
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900}
+            viewport={"width": 1366, "height": 900}
         )
         page = context.new_page()
 
-        print("[*] Navigating to High Court Portal via Indian Gateway...")
-        page.goto(
-            "https://judiciary.karnataka.gov.in/causelistSearch.php", 
-            wait_until="domcontentloaded", 
-            timeout=90000
-        )
-        print("[+] Portal successfully connected.")
-        page.wait_for_timeout(2000)
+        print("[*] Connecting to High Court Portal via Indian Gateway...")
+        page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(3000)
 
-        # 1. Bench Selection: Bengaluru Bench
-        bench = page.locator("select").first
-        bench.select_option(label="Bengaluru Bench")
-        page.wait_for_timeout(1000)
+        # 1. Bench Selection
+        print("[*] Selecting Bench: Bengaluru Bench")
+        bench_select = page.locator("select").first
+        bench_select.select_option(label="Bengaluru Bench")
+        page.wait_for_timeout(2000)  # Allow AJAX update
 
         # 2. Search By: Advocate
-        search_by = page.locator("select").nth(1)
-        try:
-            search_by.select_option(label="Advocate")
-        except Exception:
-            page.select_option("select:has-text('Advocate')", label="Advocate")
-        page.wait_for_timeout(1000)
-
-        # 3. Advocate Name
-        adv_input = page.locator("input[type='text']:visible").first
-        adv_input.fill("Mahesh Chowdhary")
-
-        # 4. Dates (From and To)
-        date_inputs = page.locator("input[placeholder*='DD/MM/YYYY'], input[name*='date'], input[id*='date']").all()
-        if len(date_inputs) >= 2:
-            date_inputs[0].fill(date_str)
-            date_inputs[1].fill(date_str)
-        else:
-            for inp in page.locator("input[type='text']:visible").all()[1:]:
-                inp.fill(date_str)
-
-        page.wait_for_timeout(1000)
-
-        # 5. Click PRINT LIST to generate printable cause list view
-        print_btn = page.locator("input[value*='PRINT'], button:has-text('PRINT')").first
+        print("[*] Selecting Search By: Advocate")
+        # Search dropdowns for one containing 'Advocate'
+        search_by_select = None
+        for sel in page.locator("select").all():
+            options_text = sel.inner_text()
+            if "Advocate" in options_text:
+                search_by_select = sel
+                break
         
-        try:
-            with context.expect_page(timeout=15000) as popup_info:
-                print_btn.click()
-            target_page = popup_info.value
-            target_page.wait_for_load_state("domcontentloaded")
-            page.wait_for_timeout(2000)
-            target_page.pdf(path=pdf_path, format="A4", print_background=True)
-            print(f"[+] Saved cause list PDF via popup to {pdf_path}")
-        except Exception:
-            page.wait_for_timeout(2000)
+        if search_by_select:
+            search_by_select.select_option(label="Advocate")
+        else:
+            page.locator("select").nth(1).select_option(label="Advocate")
+        
+        # Give page time to load the dynamic Advocate input field
+        page.wait_for_timeout(3000)
+
+        # 3. Enter Dates (From / To or single Causelist Date)
+        print(f"[*] Entering Causelist Date: {date_str}")
+        date_fields = page.locator("input[placeholder*='DD/MM/YYYY'], input[name*='date' i], input[id*='date' i], input.hasDatepicker").all()
+        if date_fields:
+            for d_field in date_fields:
+                d_field.click()
+                d_field.fill("")
+                d_field.fill(date_str)
+        else:
+            print("[!] Warning: Specific date fields not found by attribute, searching visible text inputs...")
+
+        # 4. Enter Advocate Name
+        print("[*] Locating Advocate Name input...")
+        adv_field = None
+        # Check by name or id containing 'adv'
+        adv_candidates = page.locator("input[name*='adv' i], input[id*='adv' i], input[placeholder*='adv' i]").all()
+        if adv_candidates:
+            adv_field = adv_candidates[0]
+        else:
+            # Fallback: find input preceded by 'Advocate' text in table/form
+            adv_field = page.locator("//tr[contains(., 'Advocate')]//input[@type='text'] | //div[contains(., 'Advocate')]//input[@type='text']").first
+
+        if not adv_field or not adv_field.is_visible():
+            # Final fallback: find the text input that does not contain the date
+            all_text_inputs = page.locator("input[type='text']:visible").all()
+            for inp in all_text_inputs:
+                val = inp.input_value()
+                if val != date_str:
+                    adv_field = inp
+                    break
+
+        if adv_field:
+            adv_field.click()
+            adv_field.fill("")
+            adv_field.fill("Mahesh Chowdhary")
+            print(f"[+] Advocate field filled. Verified Value: '{adv_field.input_value()}'")
+        else:
+            print("[FATAL] Unable to isolate Advocate input box!")
+
+        # Take screenshot of filled form
+        page.screenshot(path="01_form_filled.png")
+        print("[*] Saved screenshot: 01_form_filled.png")
+
+        # 5. CLICK 'GET DETAILS' FIRST
+        print("[*] Submitting search via 'GET DETAILS'...")
+        get_details_btn = page.locator("input[value*='GET DETAILS' i], input[value*='DETAILS' i], button:has-text('GET DETAILS'), button:has-text('DETAILS')").first
+        
+        if get_details_btn.is_visible():
+            get_details_btn.click()
+            print("[*] 'GET DETAILS' clicked. Waiting for records to load...")
+            page.wait_for_timeout(5000)
+            page.wait_for_load_state("networkidle")
+        else:
+            print("[!] 'GET DETAILS' button not explicitly found, attempting generic search/submit...")
+            page.locator("input[type='submit']:visible, button[type='submit']:visible").first.click()
+            page.wait_for_timeout(5000)
+
+        # Screenshot after search
+        page.screenshot(path="02_search_results.png")
+        print("[*] Saved screenshot: 02_search_results.png")
+
+        # Check if table appeared on page
+        tables = page.locator("table").all()
+        print(f"[*] Detected {len(tables)} tables on page after search.")
+
+        # 6. CLICK 'PRINT LIST' TO GET CLEAN PDF
+        print("[*] Locating 'PRINT LIST' button...")
+        print_btn = page.locator("input[value*='PRINT' i], button:has-text('PRINT' i)").first
+        
+        if print_btn.is_visible():
+            try:
+                with context.expect_page(timeout=10000) as popup_info:
+                    print_btn.click()
+                target_page = popup_info.value
+                target_page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(2000)
+                target_page.pdf(path=pdf_path, format="A4", print_background=True)
+                print(f"[+] Successfully captured cause list PDF via print popup to {pdf_path}")
+            except Exception as e:
+                print(f"[!] Popup did not open ({e}), capturing PDF from current page...")
+                page.pdf(path=pdf_path, format="A4", print_background=True)
+        else:
+            print("[*] 'PRINT LIST' button not present; rendering page directly to PDF...")
             page.pdf(path=pdf_path, format="A4", print_background=True)
-            print(f"[+] Saved cause list PDF to {pdf_path}")
 
         browser.close()
-
-import time
 
 def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -134,12 +201,10 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     prompt = (
         "Extract the complete cause list table from this PDF into the structured JSON schema. "
         "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
-        "If there are no cases listed or the list is empty, return an empty rows array."
+        "Do not omit any row. If no cases are listed, return an empty rows array."
     )
 
     model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-
-    # Retry loop with exponential backoff for 503 temporary demand spikes
     max_retries = 5
     response = None
 
@@ -158,21 +223,19 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
                     temperature=0.0
                 )
             )
-            # If successful, break out of retry loop
             break
         except Exception as e:
             err_str = str(e)
             if "503" in err_str or "UNAVAILABLE" in err_str or "ResourceExhausted" in err_str:
                 if attempt < max_retries:
-                    wait_time = attempt * 8  # 8s, 16s, 24s, 32s
-                    print(f"[!] Server busy (503/Spike). Pausing {wait_time}s before retry...")
+                    wait_time = attempt * 8
+                    print(f"[!] Demand spike (503). Pausing {wait_time}s before retry...")
                     time.sleep(wait_time)
                     continue
-            # If not a temporary demand error, or out of retries, raise
             raise
 
     parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
-    print(f"[+] Extracted {len(parsed.rows)} rows for date: {parsed.date}")
+    print(f"[+] Successfully extracted {len(parsed.rows)} rows for date: {parsed.date}")
 
     wb = openpyxl.Workbook()
     ws = wb.active
