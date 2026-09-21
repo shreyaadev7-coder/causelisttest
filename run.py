@@ -1,37 +1,38 @@
 import os
 import sys
-import re
+import traceback
 from datetime import datetime, timedelta
 import pytz
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+# Define schema matching exact PDF columns
 class CauseListRow(BaseModel):
     sl_no: str = Field(description="First SL NO column")
-    case_number: str = Field(description="CASE NUMBER")
-    case_name: str = Field(description="Full CASE NAME")
-    ch: str = Field(description="Court Hall number")
-    list_num: str = Field(description="List number")
-    list_sl_no: str = Field(description="Second SL NO column")
-    status: str = Field(description="STATUS")
-    judges: str = Field(description="JUDGES")
+    case_number: str = Field(description="CASE NUMBER (e.g. WP NO 102709/2026)")
+    case_name: str = Field(description="Full CASE NAME with parties and respondent notes")
+    ch: str = Field(description="Court Hall number under CH")
+    list_num: str = Field(description="List number under LIST")
+    list_sl_no: str = Field(description="Second SL NO column (Item number)")
+    status: str = Field(description="STATUS column (e.g. ORDERS, PRELIMINARY HEARING)")
+    judges: str = Field(description="JUDGES column with full bench text")
 
 class CauseListDocument(BaseModel):
-    date: str = Field(description="Date of the cause list")
+    date: str = Field(description="Date displayed at top of cause list")
     rows: list[CauseListRow]
 
 def get_next_day_ist():
     ist = pytz.timezone('Asia/Kolkata')
     next_day = datetime.now(ist) + timedelta(days=1)
-    return next_day.strftime("%d-%m-%Y"), next_day.strftime("%d/%m/%Y")
+    return next_day.strftime("%d/%m/%Y")
 
 def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
-    date_dash, date_slash = get_next_day_ist()
-    print(f"[*] Target Causelist Date (IST): {date_dash} ({date_slash})")
+    date_str = get_next_day_ist()
+    print(f"[*] Targeting Causelist Date (IST): {date_str}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -39,113 +40,91 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            accept_downloads=True
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
 
         try:
-            print("[*] Navigating to Karnataka High Court cause list search...")
-            response = page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", timeout=60000)
-            print(f"[*] Page loaded with HTTP status: {response.status if response else 'Unknown'}")
+            print("[*] Navigating to High Court Portal...")
+            page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3000)
 
-            # 1. Select Bench
-            print("[*] Selecting Bengaluru Bench...")
-            bench_select = page.locator("select").first
-            bench_select.select_option(label="Bengaluru Bench")
+            # 1. Select Bench: Bengaluru Bench
+            bench = page.locator("select").first
+            bench.select_option(label="Bengaluru Bench")
+            page.wait_for_timeout(1000)
 
-            # 2. Causelist Date
-            print(f"[*] Setting date: {date_slash}...")
-            # Target any date input field or text input
-            date_input = page.locator("input[type='text'], input[name*='date']").first
-            date_input.fill(date_slash)
+            # 2. Select Search By: Advocate
+            search_by = page.locator("select").nth(1)
+            try:
+                search_by.select_option(label="Advocate")
+            except Exception:
+                # Fallback search by text value
+                page.select_option("select:has-text('Advocate')", label="Advocate")
+            page.wait_for_timeout(1000)
 
-            # 3. Select Advocate Search
-            print("[*] Selecting Advocate filter...")
-            adv_radio = page.locator("input[type='radio'][value*='adv'], input[type='radio'][value*='A'], input[type='radio']").nth(0)
-            adv_radio.check()
+            # 3. Fill Advocate Name
+            adv_input = page.locator("input[type='text']:visible").first
+            adv_input.fill("Mahesh Chowdhary")
 
-            # 4. Advocate Name
-            print("[*] Entering Advocate Name: Mahesh Chowdhary...")
-            adv_name_input = page.locator("input[name*='adv'], input[id*='adv'], input[type='text']").nth(1)
-            adv_name_input.fill("Mahesh Chowdhary")
-
-            # 5. Handle Captcha if present
-            captcha_img = page.locator("img[src*='captcha'], #captcha_image, img")
-            if captcha_img.count() > 0 and "captcha" in (captcha_img.first.get_attribute("src") or "").lower():
-                print("[*] Captcha detected. Solving via Gemini...")
-                captcha_img.first.screenshot(path="captcha.png")
-                ai_client = genai.Client()
-                with open("captcha.png", "rb") as f:
-                    c_bytes = f.read()
-                cap_res = ai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        types.Part.from_bytes(data=c_bytes, mime_type="image/png"),
-                        "Output only the alphanumeric characters in this captcha image. No explanation."
-                    ]
-                )
-                cap_val = re.sub(r'[^A-Za-z0-9]', '', cap_res.text.strip())
-                print(f"[*] Solved Captcha: {cap_val}")
-                page.locator("input[name*='captcha'], #captcha").first.fill(cap_val)
-
-            # 6. Click Submit & Wait for Download
-            print("[*] Submitting search...")
-            submit_btn = page.locator("input[type='submit'], button[type='submit'], input[value*='Search'], button:has-text('Search')").first
-            
-            with page.expect_download(timeout=20000) as download_info:
-                submit_btn.click()
-            
-            download = download_info.value
-            download.save_as(pdf_path)
-            print(f"[✓] Successfully downloaded PDF: {pdf_path}")
-            return True
-
-        except PlaywrightTimeoutError:
-            # Check if an on-screen alert or message appeared
-            page_text = page.locator("body").inner_text()
-            page.screenshot(path="failure.png")
-            print("[!] Download timed out. Saved screenshot to failure.png.")
-
-            if "no record" in page_text.lower() or "not found" in page_text.lower():
-                print("[*] Court portal returned: No records / cause list not yet published for tomorrow.")
-                return False
+            # 4. Fill Causelist Date (From and To)
+            date_inputs = page.locator("input[placeholder*='DD/MM/YYYY'], input[name*='date'], input[id*='date']").all()
+            if len(date_inputs) >= 2:
+                date_inputs[0].fill(date_str)
+                date_inputs[1].fill(date_str)
             else:
-                print(f"[!] Current page snippet: {page_text[:300]}")
-                raise
+                for inp in page.locator("input[type='text']:visible").all()[1:]:
+                    inp.fill(date_str)
+
+            page.wait_for_timeout(1000)
+
+            # 5. Click PRINT LIST to generate document view
+            print_btn = page.locator("input[value*='PRINT'], button:has-text('PRINT')").first
+            
+            # Check if PRINT LIST opens a new popup tab
+            with context.expect_page(timeout=10000) as popup_info:
+                print_btn.click()
+            
+            target_page = popup_info.value
+            target_page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            # Render to PDF
+            target_page.pdf(path=pdf_path, format="A4", print_background=True)
+            print(f"[+] Successfully saved cause list PDF to {pdf_path}")
 
         except Exception as e:
-            page.screenshot(path="failure.png")
-            print(f"[!] Error during scraping: {e}")
-            raise
+            # Check if results loaded on current page rather than a popup
+            print(f"[!] Popup did not appear ({e}), checking main page...")
+            try:
+                page.pdf(path=pdf_path, format="A4", print_background=True)
+                print(f"[+] Saved main page PDF to {pdf_path}")
+            except Exception as inner_err:
+                print(f"[ERROR] Failed to capture cause list: {inner_err}")
+                page.screenshot(path="failure.png", full_page=True)
+                with open("page_dump.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                raise
 
         finally:
             browser.close()
 
-def create_empty_excel(excel_path="cause_list.xlsx", message="No matters listed for tomorrow."):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Cause List"
-    headers = ["SL NO", "CASE NUMBER", "CASE NAME", "CH", "LIST", "SL NO", "STATUS", "JUDGES"]
-    ws.append(headers)
-    ws.append([message] + [""] * 7)
-    wb.save(excel_path)
-    print(f"[*] Empty cause list placeholder written to {excel_path}")
-
 def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY secret is not set in repository environment!")
+        raise ValueError("GEMINI_API_KEY environment variable is missing.")
 
-    client = genai.Client()
+    client = genai.Client(api_key=api_key)
+
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
-    print("[*] Sending PDF to Gemini 2.5 Flash for table extraction...")
+    print("[*] Submitting cause list PDF to Gemini 2.5 Flash...")
     prompt = (
-        "Extract the exact cause list table from this PDF document into the structured schema. "
-        "Preserve exact cell contents, party names, judge titles, case numbers, and status text. "
-        "Do not omit any row or column."
+        "Extract the complete cause list table from this PDF into the structured JSON schema. "
+        "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
+        "If there are no cases listed, return an empty rows array."
     )
 
     response = client.models.generate_content(
@@ -162,8 +141,9 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     )
 
     parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
-    print(f"[✓] Extracted {len(parsed.rows)} rows for date: {parsed.date}")
+    print(f"[+] Extracted {len(parsed.rows)} rows for date: {parsed.date}")
 
+    # Build Excel
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Cause List"
@@ -185,14 +165,19 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
         cell = ws.cell(row=1, column=col_idx)
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = thin_border
 
     for row in parsed.rows:
         ws.append([
-            row.sl_no, row.case_number, row.case_name,
-            row.ch, row.list_num, row.list_sl_no,
-            row.status, row.judges
+            row.sl_no,
+            row.case_number,
+            row.case_name,
+            row.ch,
+            row.list_num,
+            row.list_sl_no,
+            row.status,
+            row.judges
         ])
 
     for r in range(2, ws.max_row + 1):
@@ -210,11 +195,13 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
     wb.save(excel_path)
-    print(f"[✓] Excel workbook created at {excel_path}")
+    print(f"[+] Excel written to {excel_path}")
 
 if __name__ == "__main__":
-    has_pdf = fetch_cause_list_pdf("causelist.pdf")
-    if has_pdf and os.path.exists("causelist.pdf"):
+    try:
+        fetch_cause_list_pdf("causelist.pdf")
         parse_pdf_to_excel("causelist.pdf", "cause_list.xlsx")
-    else:
-        create_empty_excel("cause_list.xlsx", "No cases listed or cause list not yet released.")
+    except Exception as err:
+        print(f"[FATAL] Process aborted: {err}", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
