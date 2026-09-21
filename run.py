@@ -34,53 +34,68 @@ def get_target_date_ist():
         return manual.strip()
     return "22/09/2026"
 
-def clean_party_string(s: str) -> str:
-    """Strips out prefixes, advocate names, and procedural notes."""
-    # Strip leading PET:, RES:, etc.
-    s = re.sub(r'^(?:PET|RES|PETITIONER|RESPONDENT|APPELLANT|COMPLAINANT)\s*:\s*', '', s, flags=re.I)
-    # Strip procedural notes in parentheses
-    s = re.sub(r'\([^\)]*\)', '', s)
-    # Cut off at ADV: or ADVOCATE:
-    adv_split = re.split(r'\b(?:ADV|ADVOCATE|ADVOCATES|COUNSEL)\s*[:.]?\s*', s, flags=re.I)
-    s = adv_split[0]
-    # Filter out comma-separated lawyer tokens
-    chunks = [c.strip() for c in re.split(r'[,;]', s) if c.strip()]
-    valid = []
-    for c in chunks:
-        if not re.search(r'\b(MAHESH|CHOWDHA?R[YI]|AGA|HCGP|ADV|ADVOCATE|ADVOCATES|COUNSEL|FOR\s+RES|FOR\s+PET|GOVT|PLEADER)\b', c, re.I):
-            valid.append(c)
-    res = ", ".join(valid) if valid else (chunks[0] if chunks else s)
-    return res.strip(" ,;:-")
-
 def clean_case_details(raw_name: str):
     """
-    Splits case text into Petitioner and Respondent,
-    and identifies which side Mahesh Chowdhary represents.
+    Cleans raw case name into:
+    [Petitioner] vs [Respondent]
+    Identifies which party Mahesh Chowdhary represents.
+    Removes all advocate names and procedural notes.
     """
     text = re.sub(r'[\r\n]+', ' ', raw_name)
     text = re.sub(r'\s+', ' ', text).strip()
 
-    vs_match = re.search(r'\s+(?:V/?S\.?|VERSUS)\s+', text, re.I)
-    res_match = re.search(r'\b(?:RES|RESPONDENT|RESPODNENT)\s*:\s*', text, re.I)
-
+    # 1. Split into Petitioner and Respondent parts
+    vs_match = re.search(r'\s+(?:-?\s*V/?S\.?\s*-?|VERSUS)\s+', text, re.I)
     if vs_match:
-        pet_block = text[:vs_match.start()].strip()
-        res_block = text[vs_match.end():].strip()
-    elif res_match:
-        pet_block = text[:res_match.start()].strip()
-        res_block = text[res_match.start():].strip()
+        pet_raw = text[:vs_match.start()].strip()
+        res_raw = text[vs_match.end():].strip()
     else:
-        pet_block = text
-        res_block = ""
+        # Split when portal uses RES: / RESP: without the word VS
+        res_match = re.search(r'[\s\-]+(?:RES|RESPONDENT|RESPODNENT)\s*:\s*', text, re.I)
+        if res_match:
+            pet_raw = text[:res_match.start()].strip()
+            res_raw = text[res_match.start():].strip()
+        else:
+            pet_raw = text
+            res_raw = ""
 
-    # Detect which side Mahesh Chowdhary represents
-    if re.search(r'\b(MAHESH|CHOWDHA?R[YI])\b', res_block, re.I):
+    # 2. Detect which side Mahesh Chowdhary is on
+    is_res_rep = bool(re.search(r'\b(RESPONDENT|RES)\b.*?\b(NO|NOS|R\d+|\d+)\b', text, re.I))
+    if re.search(r'\b(MAHESH|CHOWDHA?R[YI])\b', res_raw, re.I):
+        in_charge = "RES"
+    elif re.search(r'\b(MAHESH|CHOWDHA?R[YI])\b', pet_raw, re.I):
+        in_charge = "PET"
+    elif is_res_rep:
         in_charge = "RES"
     else:
         in_charge = "PET"
 
-    pet_clean = clean_party_string(pet_block)
-    res_clean = clean_party_string(res_block)
+    # 3. Strip out ADV:, lawyer names, and notes
+    def strip_advocates_and_noise(s: str) -> str:
+        # Remove PET:, RES:, etc.
+        s = re.sub(r'^\s*[-:]?\s*(?:PET|RES|PETITIONER|RESPONDENT|APPELLANT|COMPLAINANT)\s*:\s*', '', s, flags=re.I)
+        # Remove parenthetical notes like (MA NOT FILED)
+        s = re.sub(r'\([^\)]*\)', '', s)
+
+        # Cut off everything from ADV: onward
+        adv_match = re.search(r'\b(?:ADV|ADVOCATE|ADVOCATES|COUNSEL)\s*[:.]?', s, re.I)
+        if adv_match:
+            s = s[:adv_match.start()]
+
+        # Filter out lawyer tokens if separated by commas
+        chunks = [c.strip() for c in re.split(r'[,;]', s) if c.strip()]
+        clean_chunks = []
+        for c in chunks:
+            if not re.search(r'\b(MAHESH|CHOWDHA?R[YI]|AGA|HCGP|ADV|ADVOCATE|ADVOCATES|COUNSEL|FOR\s+RES|FOR\s+PET|GOVT|PLEADER)\b', c, re.I):
+                clean_chunks.append(c)
+
+        res = ", ".join(clean_chunks) if clean_chunks else (chunks[0] if chunks else s)
+        res = re.sub(r'^[\s,;:\-]+', '', res)
+        res = re.sub(r'[\s,;:\-]+$', '', res)
+        return res.strip()
+
+    pet_clean = strip_advocates_and_noise(pet_raw)
+    res_clean = strip_advocates_and_noise(res_raw)
 
     return pet_clean, res_clean, in_charge
 
@@ -251,7 +266,7 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
 
     for idx, row in enumerate(rows, start=1):
         pet_clean, res_clean, in_charge = clean_case_details(row.case_name)
-        plain_text = f"{pet_clean}\nvs\n{res_clean}"
+        plain_text = f"{pet_clean} vs {res_clean}"
 
         # 2. Sequential SL NO (1, 2, 3...)
         ws.append([
@@ -266,26 +281,25 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
         ])
 
         curr_row = idx + 1
-        # Set row height to 45 so cells do not collapse
         ws.row_dimensions[curr_row].height = 45
 
-        # 3. Bold only Mahesh Chowdhary's party
+        # 3. Bold only Mahesh Chowdhary's party (plain text, no colors, no extra notes)
         case_cell = ws.cell(row=curr_row, column=3)
         try:
             if in_charge == "PET":
                 case_cell.value = CellRichText(
                     TextBlock(bold_font, pet_clean),
-                    TextBlock(regular_font, f"\nvs\n{res_clean}")
+                    TextBlock(regular_font, f" vs {res_clean}")
                 )
             else:
                 case_cell.value = CellRichText(
-                    TextBlock(regular_font, f"{pet_clean}\nvs\n"),
+                    TextBlock(regular_font, f"{pet_clean} vs "),
                     TextBlock(bold_font, res_clean)
                 )
         except Exception:
             case_cell.value = plain_text
 
-    # Apply borders, text wrapping, and bold case number
+    # Apply borders, text wrapping, and case number bold
     for r in range(2, ws.max_row + 1):
         for c in range(1, 9):
             cell = ws.cell(row=r, column=c)
@@ -297,8 +311,6 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
                 # Case number in bold
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(name="Calibri", size=10, bold=True)
-            elif c == 3:
-                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
             else:
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                 if c != 3:
@@ -317,9 +329,9 @@ def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
     for idx, row in enumerate(rows, start=1):
         pet_clean, res_clean, in_charge = clean_case_details(row.case_name)
         if in_charge == "PET":
-            case_name_cell = f"<strong>{pet_clean}</strong><br>vs<br>{res_clean}"
+            case_name_cell = f"<strong>{pet_clean}</strong> vs {res_clean}"
         else:
-            case_name_cell = f"{pet_clean}<br>vs<br><strong>{res_clean}</strong>"
+            case_name_cell = f"{pet_clean} vs <strong>{res_clean}</strong>"
 
         rows_html += f"""
         <tr>
