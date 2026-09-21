@@ -15,17 +15,17 @@ from openpyxl.cell.rich_text import TextBlock, CellRichText
 from openpyxl.cell.text import InlineFont
 
 class CauseListRow(BaseModel):
-    sl_no: str
-    case_number: str
-    case_name: str
-    ch: str
-    list_num: str
-    list_sl_no: str
-    status: str
-    judges: str
+    sl_no: str = Field(description="Serial number")
+    case_number: str = Field(description="Case number like WP NO 102709/2026")
+    case_name: str = Field(description="Party names and representation details")
+    ch: str = Field(description="Court Hall number")
+    list_num: str = Field(description="List number")
+    list_sl_no: str = Field(description="Item number")
+    status: str = Field(description="Case status like ORDERS")
+    judges: str = Field(description="Hon'ble Judge name(s)")
 
 class CauseListDocument(BaseModel):
-    date: str
+    date: str = Field(description="Date of the cause list")
     rows: list[CauseListRow]
 
 def get_target_date_ist():
@@ -34,95 +34,63 @@ def get_target_date_ist():
         return manual.strip()
     return "22/09/2026"
 
+def clean_party_string(s: str) -> str:
+    """Strips out prefixes, advocate names, and procedural notes."""
+    # Strip leading PET:, RES:, etc.
+    s = re.sub(r'^(?:PET|RES|PETITIONER|RESPONDENT|APPELLANT|COMPLAINANT)\s*:\s*', '', s, flags=re.I)
+    # Strip procedural notes in parentheses
+    s = re.sub(r'\([^\)]*\)', '', s)
+    # Cut off at ADV: or ADVOCATE:
+    adv_split = re.split(r'\b(?:ADV|ADVOCATE|ADVOCATES|COUNSEL)\s*[:.]?\s*', s, flags=re.I)
+    s = adv_split[0]
+    # Filter out comma-separated lawyer tokens
+    chunks = [c.strip() for c in re.split(r'[,;]', s) if c.strip()]
+    valid = []
+    for c in chunks:
+        if not re.search(r'\b(MAHESH|CHOWDHA?R[YI]|AGA|HCGP|ADV|ADVOCATE|ADVOCATES|COUNSEL|FOR\s+RES|FOR\s+PET|GOVT|PLEADER)\b', c, re.I):
+            valid.append(c)
+    res = ", ".join(valid) if valid else (chunks[0] if chunks else s)
+    return res.strip(" ,;:-")
+
 def clean_case_details(raw_name: str):
     """
-    Cleans raw case name into:
-    [Petitioner]
-    vs
-    [Respondent]
-    Bolds only the party Mahesh Chowdhary represents.
+    Splits case text into Petitioner and Respondent,
+    and identifies which side Mahesh Chowdhary represents.
     """
-    # 1. Normalize line breaks and spaces
     text = re.sub(r'[\r\n]+', ' ', raw_name)
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # 2. Split into Petitioner and Respondent parts
-    vs_match = re.search(r'\s+(-?V/?S\.?-?|VERSUS)\s+', text, re.I)
-    if vs_match:
-        pet_raw = text[:vs_match.start()].strip()
-        res_raw = text[vs_match.end():].strip()
-    else:
-        # Split when portal uses RES: without VS
-        res_match = re.search(r'\b(?:RES|RESPONDENT|RESPODNENT)\s*:\s*', text, re.I)
-        if res_match:
-            pet_raw = text[:res_match.start()].strip()
-            res_raw = text[res_match.start():].strip()
-        else:
-            pet_raw = text
-            res_raw = ""
+    vs_match = re.search(r'\s+(?:V/?S\.?|VERSUS)\s+', text, re.I)
+    res_match = re.search(r'\b(?:RES|RESPONDENT|RESPODNENT)\s*:\s*', text, re.I)
 
-    # 3. Detect which side Mahesh Chowdhary is on
-    if re.search(r'\b(MAHESH|CHOWDHA?R[YI])\b', res_raw, re.I):
+    if vs_match:
+        pet_block = text[:vs_match.start()].strip()
+        res_block = text[vs_match.end():].strip()
+    elif res_match:
+        pet_block = text[:res_match.start()].strip()
+        res_block = text[res_match.start():].strip()
+    else:
+        pet_block = text
+        res_block = ""
+
+    # Detect which side Mahesh Chowdhary represents
+    if re.search(r'\b(MAHESH|CHOWDHA?R[YI])\b', res_block, re.I):
         in_charge = "RES"
     else:
         in_charge = "PET"
 
-    # 4. Strip out ADV:, advocate names, and procedural notes
-    def strip_advocates_and_notes(s: str) -> str:
-        s = re.sub(r'^(PET|RES|PETITIONER|RESPONDENT|APPELLANT|COMPLAINANT)\s*:\s*', '', s, flags=re.I)
-        s = re.sub(r'\([^\)]*\)', '', s)  # Remove (MA NOT FILED) etc.
-
-        # Cut off everything from ADV: onward
-        adv_match = re.search(r'\b(?:ADV|ADVOCATE|ADVOCATES|COUNSEL)\s*[:.]', s, re.I)
-        if adv_match:
-            s = s[:adv_match.start()]
-
-        # Remove comma-separated lawyer names if ADV: was omitted
-        chunks = [c.strip() for c in re.split(r'[,;]', s) if c.strip()]
-        clean_chunks = []
-        for c in chunks:
-            if not re.search(r'\b(MAHESH|CHOWDHA?R[YI]|AGA|HCGP|ADV|ADVOCATE|ADVOCATES|COUNSEL|FOR\s+RES|FOR\s+PET|GOVT|PLEADER)\b', c, re.I):
-                clean_chunks.append(c)
-
-        res = ", ".join(clean_chunks) if clean_chunks else (chunks[0] if chunks else s)
-        res = re.sub(r'^[\s,;:\-]+', '', res)
-        res = re.sub(r'[\s,;:\-]+$', '', res)
-        return res.strip()
-
-    pet_clean = strip_advocates_and_notes(pet_raw)
-    res_clean = strip_advocates_and_notes(res_raw)
+    pet_clean = clean_party_string(pet_block)
+    res_clean = clean_party_string(res_block)
 
     return pet_clean, res_clean, in_charge
 
-def extract_real_causelist_table(target_page) -> list[list[str]]:
-    """Extracts only the actual cause list table from page DOM."""
-    for table in target_page.locator("table").all():
-        table_text = table.inner_text().upper()
-        if "CASE NUMBER" in table_text or "CASE NO" in table_text:
-            extracted = []
-            for row in table.locator("tr").all():
-                cells = [td.inner_text().strip() for td in row.locator("th, td").all()]
-                if not cells:
-                    continue
-                if len(cells) > 1 and ("CASE NUMBER" in cells[1].upper() or "CASE NO" in cells[1].upper()):
-                    continue
-                if cells[0].upper() in ["SL NO", "SL.NO", ""]:
-                    continue
-                if len(cells) >= 7:
-                    while len(cells) < 8:
-                        cells.append("")
-                    extracted.append(cells[:8])
-            if extracted:
-                return extracted
-    return []
-
-def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
+def fetch_court_pdf(pdf_path="causelist.pdf"):
     date_str = get_target_date_ist()
     print(f"[*] Target Causelist Date: {date_str}")
 
     scraperapi_key = os.environ.get("SCRAPERAPI_KEY")
     if not scraperapi_key:
-        raise ValueError("SCRAPERAPI_KEY environment variable is missing from GitHub Secrets.")
+        raise ValueError("SCRAPERAPI_KEY is missing from GitHub Secrets.")
 
     launch_args = {
         "headless": True,
@@ -134,8 +102,6 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"]
     }
 
-    raw_table_rows = []
-
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch_args)
         context = browser.new_context(
@@ -144,7 +110,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             viewport={"width": 1366, "height": 900}
         )
         page = context.new_page()
-        page.add_init_script("window.print = () => { console.log('window.print intercepted'); };")
+        page.add_init_script("window.print = () => { console.log('print intercepted'); };")
 
         print("[*] Navigating to High Court Portal via Indian Gateway...")
         page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=90000)
@@ -183,10 +149,10 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         # 5. Click GET DETAILS
         page.locator("#getData:visible").first.click()
-        print("[*] Waiting 7 seconds for court database query to complete...")
+        print("[*] Waiting for search results...")
         page.wait_for_timeout(7000)
 
-        # 6. Locate Print Button
+        # 6. Click Print Button
         print_btn = None
         for btn in page.locator("input[type='button']:visible, button:visible").all():
             val = (btn.get_attribute("value") or "").lower()
@@ -208,15 +174,52 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             except Exception:
                 target_page = page
 
-        raw_table_rows = extract_real_causelist_table(target_page)
-        if not raw_table_rows and target_page != page:
-            raw_table_rows = extract_real_causelist_table(page)
-
-        print(f"[+] Verified case rows found: {len(raw_table_rows)}")
         target_page.pdf(path=pdf_path, format="A4", print_background=True)
+        print(f"[+] Downloaded court PDF to {pdf_path}")
         browser.close()
 
-    return raw_table_rows
+def parse_pdf_with_gemini(pdf_path="causelist.pdf"):
+    """Uses Gemini to parse actual case rows, ignoring banner notices."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is missing.")
+
+    client = genai.Client(api_key=api_key)
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    prompt = (
+        "Extract the complete cause list table from this PDF into the structured JSON schema. "
+        "Strictly extract only actual case rows with case numbers and parties. "
+        "Do NOT extract video conference notices, header banners, or general instructions as cases. "
+        "If there are no cases listed, return an empty rows array."
+    )
+
+    models = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.6-flash"]
+    parsed = None
+
+    for model_name in models:
+        try:
+            print(f"[*] Submitting PDF to {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CauseListDocument,
+                    temperature=0.0
+                )
+            )
+            parsed = CauseListDocument.model_validate_json(response.text)
+            print(f"[+] Successfully extracted {len(parsed.rows)} case records via {model_name}.")
+            break
+        except Exception as e:
+            print(f"[!] {model_name} unavailable ({e}), trying next model...")
+            time.sleep(2)
+
+    if not parsed:
+        raise RuntimeError("Unable to extract records from Gemini API.")
+    return parsed.rows
 
 def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
     wb = openpyxl.Workbook()
@@ -247,42 +250,26 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
     regular_font = InlineFont(rFont="Calibri", sz=10, b=False)
 
     for idx, row in enumerate(rows, start=1):
-        if isinstance(row, CauseListRow):
-            case_num = row.case_number.strip()
-            raw_case_name = row.case_name.strip()
-            ch = row.ch.strip()
-            list_num = row.list_num.strip()
-            list_sl_no = row.list_sl_no.strip()
-            status = row.status.strip()
-            judges = row.judges.strip()
-        else:
-            case_num = row[1].strip() if len(row) > 1 else ""
-            raw_case_name = row[2].strip() if len(row) > 2 else ""
-            ch = row[3].strip() if len(row) > 3 else ""
-            list_num = row[4].strip() if len(row) > 4 else ""
-            list_sl_no = row[5].strip() if len(row) > 5 else ""
-            status = row[6].strip() if len(row) > 6 else ""
-            judges = row[7].strip() if len(row) > 7 else ""
-
-        pet_clean, res_clean, in_charge = clean_case_details(raw_case_name)
+        pet_clean, res_clean, in_charge = clean_case_details(row.case_name)
+        plain_text = f"{pet_clean}\nvs\n{res_clean}"
 
         # 2. Sequential SL NO (1, 2, 3...)
         ws.append([
             idx,
-            case_num,
-            f"{pet_clean}\nvs\n{res_clean}",
-            ch,
-            list_num,
-            list_sl_no,
-            status,
-            judges
+            row.case_number.strip(),
+            plain_text,
+            row.ch.strip(),
+            row.list_num.strip(),
+            row.list_sl_no.strip(),
+            row.status.strip(),
+            row.judges.strip()
         ])
 
         curr_row = idx + 1
-        # Set explicit row height to prevent collapsed cells
+        # Set row height to 45 so cells do not collapse
         ws.row_dimensions[curr_row].height = 45
 
-        # 3. Bold only Mahesh Chowdhary's client party
+        # 3. Bold only Mahesh Chowdhary's party
         case_cell = ws.cell(row=curr_row, column=3)
         try:
             if in_charge == "PET":
@@ -296,9 +283,9 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
                     TextBlock(bold_font, res_clean)
                 )
         except Exception:
-            case_cell.value = f"{pet_clean}\nvs\n{res_clean}"
+            case_cell.value = plain_text
 
-    # Format Data Rows: borders, alignment, and bold case number
+    # Apply borders, text wrapping, and bold case number
     for r in range(2, ws.max_row + 1):
         for c in range(1, 9):
             cell = ws.cell(row=r, column=c)
@@ -314,7 +301,8 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
             else:
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-                cell.font = Font(name="Calibri", size=10, bold=False)
+                if c != 3:
+                    cell.font = Font(name="Calibri", size=10, bold=False)
 
     col_widths = {1: 8, 2: 24, 3: 45, 4: 8, 5: 8, 6: 10, 7: 25, 8: 35}
     for col_idx, width in col_widths.items():
@@ -324,28 +312,10 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
     print(f"[+] Excel written to {excel_path}")
 
 def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
-    """Generates clean landscape black-and-white table PDF."""
+    """Renders landscape black-and-white table PDF."""
     rows_html = ""
     for idx, row in enumerate(rows, start=1):
-        if isinstance(row, CauseListRow):
-            case_num = row.case_number.strip()
-            raw_case_name = row.case_name.strip()
-            ch = row.ch.strip()
-            list_num = row.list_num.strip()
-            list_sl_no = row.list_sl_no.strip()
-            status = row.status.strip()
-            judges = row.judges.strip()
-        else:
-            case_num = row[1].strip() if len(row) > 1 else ""
-            raw_case_name = row[2].strip() if len(row) > 2 else ""
-            ch = row[3].strip() if len(row) > 3 else ""
-            list_num = row[4].strip() if len(row) > 4 else ""
-            list_sl_no = row[5].strip() if len(row) > 5 else ""
-            status = row[6].strip() if len(row) > 6 else ""
-            judges = row[7].strip() if len(row) > 7 else ""
-
-        pet_clean, res_clean, in_charge = clean_case_details(raw_case_name)
-
+        pet_clean, res_clean, in_charge = clean_case_details(row.case_name)
         if in_charge == "PET":
             case_name_cell = f"<strong>{pet_clean}</strong><br>vs<br>{res_clean}"
         else:
@@ -354,13 +324,13 @@ def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
         rows_html += f"""
         <tr>
             <td class="text-center">{idx}</td>
-            <td class="text-center font-bold">{case_num}</td>
+            <td class="text-center font-bold">{row.case_number}</td>
             <td>{case_name_cell}</td>
-            <td class="text-center">{ch}</td>
-            <td class="text-center">{list_num}</td>
-            <td class="text-center">{list_sl_no}</td>
-            <td>{status}</td>
-            <td>{judges}</td>
+            <td class="text-center">{row.ch}</td>
+            <td class="text-center">{row.list_num}</td>
+            <td class="text-center">{row.list_sl_no}</td>
+            <td>{row.status}</td>
+            <td>{row.judges}</td>
         </tr>
         """
 
@@ -437,56 +407,14 @@ def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
         browser.close()
     print(f"[+] PDF cause list written to {pdf_path}")
 
-def parse_pdf_with_gemini(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is missing.")
-
-    client = genai.Client(api_key=api_key)
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
-
-    prompt = (
-        "Extract the complete cause list table from this PDF into the structured JSON schema. "
-        "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
-        "Do not omit any row. If no cases are listed, return an empty rows array."
-    )
-
-    models_to_try = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.6-flash"]
-    response = None
-
-    for model_name in models_to_try:
-        try:
-            print(f"[*] Submitting PDF to fallback AI model: {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=CauseListDocument,
-                    temperature=0.0
-                )
-            )
-            break
-        except Exception:
-            time.sleep(3)
-
-    if not response:
-        raise RuntimeError("All Gemini models are temporarily unavailable.")
-
-    parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
-    return parsed.rows
-
 if __name__ == "__main__":
     try:
-        direct_rows = fetch_cause_list_pdf("causelist.pdf")
+        fetch_court_pdf("causelist.pdf")
         target_date = get_target_date_ist()
-
-        if not direct_rows and os.path.exists("causelist.pdf"):
-            direct_rows = parse_pdf_with_gemini("causelist.pdf", "cause_list.xlsx")
-
-        write_to_excel(direct_rows, "cause_list.xlsx")
-        generate_pdf(direct_rows, target_date, "cause_list.pdf")
+        rows = parse_pdf_with_gemini("causelist.pdf")
+        
+        write_to_excel(rows, "cause_list.xlsx")
+        generate_pdf(rows, target_date, "cause_list.pdf")
         print("[+] Done! Both cause_list.xlsx and cause_list.pdf generated successfully.")
     except Exception as err:
         print(f"[FATAL] Process aborted: {err}", file=sys.stderr)
