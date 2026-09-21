@@ -2,7 +2,6 @@ name: Generate Daily Karnataka HC Cause List
 
 on:
   schedule:
-    # 13:00 UTC = 18:30 IST (Monday to Friday)
     - cron: '0 13 * * 1-5'
   workflow_dispatch:
 
@@ -43,7 +42,9 @@ jobs:
           path: |
             cause_list.xlsx
             causelist.pdf
+            00_initial_page.png
             01_form_filled.png
             02_search_results.png
+            03_print_view.png
           if-no-files-found: ignore
           retention-days: 14
