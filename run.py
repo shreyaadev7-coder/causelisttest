@@ -118,6 +118,8 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         browser.close()
 
+import time
+
 def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -128,28 +130,45 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
-    print("[*] Submitting cause list PDF to Gemini...")
     prompt = (
         "Extract the complete cause list table from this PDF into the structured JSON schema. "
         "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
         "If there are no cases listed or the list is empty, return an empty rows array."
     )
 
-    # Use the requested model version
     model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-            prompt
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=CauseListDocument,
-            temperature=0.0
-        )
-    )
+    # Retry loop with exponential backoff for 503 temporary demand spikes
+    max_retries = 5
+    response = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[*] Submitting cause list PDF to {model_name} (Attempt {attempt}/{max_retries})...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CauseListDocument,
+                    temperature=0.0
+                )
+            )
+            # If successful, break out of retry loop
+            break
+        except Exception as e:
+            err_str = str(e)
+            if "503" in err_str or "UNAVAILABLE" in err_str or "ResourceExhausted" in err_str:
+                if attempt < max_retries:
+                    wait_time = attempt * 8  # 8s, 16s, 24s, 32s
+                    print(f"[!] Server busy (503/Spike). Pausing {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+            # If not a temporary demand error, or out of retries, raise
+            raise
 
     parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
     print(f"[+] Extracted {len(parsed.rows)} rows for date: {parsed.date}")
@@ -158,7 +177,6 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     ws = wb.active
     ws.title = "Cause List"
 
-    # Exact headers matching the High Court PDF
     headers = ["SL NO", "CASE NUMBER", "CASE NAME", "CH", "LIST", "SL NO", "STATUS", "JUDGES"]
     ws.append(headers)
 
