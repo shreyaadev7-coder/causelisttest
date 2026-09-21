@@ -43,5 +43,7 @@ jobs:
           path: |
             cause_list.xlsx
             causelist.pdf
+            01_form_filled.png
+            02_search_results.png
           if-no-files-found: ignore
           retention-days: 14
