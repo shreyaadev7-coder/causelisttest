@@ -28,7 +28,8 @@ class CauseListDocument(BaseModel):
 def get_next_day_ist():
     ist = pytz.timezone('Asia/Kolkata')
     next_day = datetime.now(ist) + timedelta(days=1)
-    return next_day.strftime("%d/%m/%Y")
+    #return next_day.strftime("%d/%m/%Y")
+    return "22/09/2026"
 
 def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
     date_str = get_next_day_ist()
