@@ -14,15 +14,16 @@ from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.cell.rich_text import TextBlock, CellRichText
 from openpyxl.cell.text import InlineFont
 
+# Schema matching the exact 8 High Court PDF columns
 class CauseListRow(BaseModel):
-    sl_no: str = Field(description="First SL NO column")
+    sl_no: str = Field(description="First SL NO column (overall serial)")
     case_number: str = Field(description="CASE NUMBER (e.g. WP NO 102709/2026)")
-    case_name: str = Field(description="Full raw case name string")
+    case_name: str = Field(description="Full CASE NAME with parties and respondent notes")
     ch: str = Field(description="Court Hall number under CH")
     list_num: str = Field(description="List number under LIST")
-    list_sl_no: str = Field(description="Item number under second SL NO")
-    status: str = Field(description="STATUS column")
-    judges: str = Field(description="JUDGES column")
+    list_sl_no: str = Field(description="Second SL NO column (Item number)")
+    status: str = Field(description="STATUS column (e.g. ORDERS, PRELIMINARY HEARING)")
+    judges: str = Field(description="JUDGES column with full bench text")
 
 class CauseListDocument(BaseModel):
     date: str = Field(description="Date displayed at top of cause list")
@@ -31,17 +32,25 @@ class CauseListDocument(BaseModel):
 def get_target_date_ist():
     manual = os.environ.get("TEST_DATE")
     if manual and manual.strip():
+        print(f"[*] Overriding date with TEST_DATE: {manual.strip()}")
         return manual.strip()
+
+    # Hardcoded test date for verification
     return "22/09/2026"
+
+    # Production logic:
+    # ist = pytz.timezone('Asia/Kolkata')
+    # next_day = datetime.now(ist) + timedelta(days=1)
+    # return next_day.strftime("%d/%m/%Y")
 
 def clean_case_details(raw_name: str):
     """
-    Cleans raw case name strictly into '[Petitioner] vs [Respondent]'
+    Cleans raw case name into '[Petitioner] vs [Respondent]'
     and determines which party Mahesh Chowdhary represents.
     """
     text = re.sub(r'\s+', ' ', raw_name).strip()
     
-    # Check if respondent side representation is indicated (e.g., '(RESPONDENT NO. 5 TO 7)')
+    # Check if respondent side representation is indicated (e.g. '(RESPONDENT NO. 5 TO 7)')
     is_res_rep = bool(re.search(r'\b(RESPONDENT|RESPODNENT|RES)\b.*?\b(NO|NOS|R\d+|\d+)\b', text, re.I))
     
     parts = re.split(r'\s+V/?S\.?\s+', text, maxsplit=1, flags=re.IGNORECASE)
@@ -60,8 +69,12 @@ def clean_case_details(raw_name: str):
         in_charge = "PET"
 
     def filter_noise(side_text: str) -> str:
+        # Strip prefixes like PET:, RES:, etc.
         cleaned = re.sub(r'^(PET|RES|PETITIONER|RESPONDENT|APPELLANT|COMPLAINANT)\s*:\s*', '', side_text, flags=re.I)
+        # Strip parenthetical notes like (MA NOT FILED), (RESPONDENT NO. 5 TO 7)
         cleaned = re.sub(r'\([^\)]*\)', '', cleaned).strip()
+        
+        # Split by comma to remove advocate/counsel names
         chunks = [c.strip() for c in re.split(r'[,;]', cleaned) if c.strip()]
         valid_parties = []
         for c in chunks:
@@ -77,16 +90,22 @@ def clean_case_details(raw_name: str):
     return pet_clean, res_clean, in_charge
 
 def extract_rows_from_page(page) -> list[list[str]]:
+    """Directly extracts the rendered table rows from the browser DOM in 0.1s."""
+    print("[*] Extracting cause list table directly from page DOM...")
     extracted_rows = []
+    
     tables = page.locator("table:visible").all()
     for table in tables:
         rows = table.locator("tr").all()
         for row in rows:
             cells = [td.inner_text().strip() for td in row.locator("th, td").all()]
+            # Filter out empty rows or pure header duplicates
             if len(cells) >= 7 and not ("CASE NUMBER" in cells[1].upper() if len(cells) > 1 else False):
                 while len(cells) < 8:
                     cells.append("")
                 extracted_rows.append(cells[:8])
+                
+    print(f"[+] Direct DOM extraction found {len(extracted_rows)} case rows.")
     return extracted_rows
 
 def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
@@ -201,7 +220,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
     return raw_table_rows
 
 def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
-    """Writes clean cause list data to Excel without colors."""
+    """Writes standard 8-column cause list data to Excel without colors."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Cause List"
@@ -211,7 +230,7 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
     ws.append(headers)
     ws.row_dimensions[1].height = 24
 
-    # 1. Column Headers in Bold (No background colors)
+    # Column headers in bold (no colors)
     header_font = Font(name="Calibri", size=10, bold=True)
     thin_border = Border(
         left=Side(style="thin", color="000000"),
@@ -250,6 +269,7 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
         pet_clean, res_clean, in_charge = clean_case_details(raw_case_name)
         plain_case_text = f"{pet_clean}\nvs\n{res_clean}"
 
+        # 1, 2, 3 sequential numbers in the first column
         ws.append([
             idx,
             case_num,
@@ -262,9 +282,10 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
         ])
 
         curr_row = idx + 1
+        # Explicit height so cells do not collapse
         ws.row_dimensions[curr_row].height = 45
 
-        # 3. Bold the client represented by Mahesh Chowdhary
+        # Bold only Mahesh Chowdhary's party
         case_cell = ws.cell(row=curr_row, column=3)
         try:
             if in_charge == "PET":
@@ -289,14 +310,13 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(name="Calibri", size=10, bold=False)
             elif c == 2:
-                # 2. Case number in bold
+                # Case number in bold
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(name="Calibri", size=10, bold=True)
-            elif c == 3:
-                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
             else:
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-                cell.font = Font(name="Calibri", size=10, bold=False)
+                if c != 3:
+                    cell.font = Font(name="Calibri", size=10, bold=False)
 
     col_widths = {1: 8, 2: 22, 3: 45, 4: 8, 5: 8, 6: 10, 7: 25, 8: 32}
     for col_idx, width in col_widths.items():
@@ -305,8 +325,8 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
     wb.save(excel_path)
     print(f"[+] Excel successfully generated at: {excel_path}")
 
-def generate_pdf_summary(rows: list, date_str: str, pdf_path="cause_list_summary.pdf"):
-    """Generates clean black-and-white landscape A4 PDF."""
+def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
+    """Generates a clean black-and-white landscape A4 PDF table."""
     print("[*] Generating formatted PDF cause list...")
 
     rows_html = ""
@@ -409,7 +429,7 @@ def generate_pdf_summary(rows: list, date_str: str, pdf_path="cause_list_summary
                 <div>Daily Cause List &bull; Date: {date_str}</div>
             </div>
             <div style="text-align: right;">
-                <div style="font-weight: bold;">ADV. MAHESH CHOWDHARY</div>
+                <div style="font-weight: bold;">ADVOCATE: MAHESH CHOWDHARY</div>
                 <div>Total Matters: {len(rows)}</div>
             </div>
         </div>
@@ -508,10 +528,10 @@ if __name__ == "__main__":
         
         if direct_rows and len(direct_rows) > 0:
             write_to_excel(direct_rows, "cause_list.xlsx")
-            generate_pdf_summary(direct_rows, target_date, "cause_list_summary.pdf")
+            generate_pdf(direct_rows, target_date, "cause_list.pdf")
         else:
             ai_rows = parse_pdf_with_gemini("causelist.pdf", "cause_list.xlsx")
-            generate_pdf_summary(ai_rows, target_date, "cause_list_summary.pdf")
+            generate_pdf(ai_rows, target_date, "cause_list.pdf")
             
     except Exception as err:
         print(f"[FATAL] Process aborted: {err}", file=sys.stderr)
