@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+# Define schema matching exact PDF columns
 class CauseListRow(BaseModel):
     sl_no: str = Field(description="First SL NO column")
     case_number: str = Field(description="CASE NUMBER (e.g. WP NO 102709/2026)")
@@ -31,54 +32,47 @@ def get_next_day_ist():
 
 def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
     date_str = get_next_day_ist()
-    print(f"[*] Targeting Causelist Date (IST): {date_str}")
+    print(f"[*] Target Causelist Date (IST): {date_str}")
 
-    proxy_server = os.environ.get("PROXY_SERVER") # Optional: "http://ip:port"
+    scraperapi_key = os.environ.get("SCRAPERAPI_KEY")
+    if not scraperapi_key:
+        raise ValueError("SCRAPERAPI_KEY environment variable is missing from GitHub Secrets.")
+
+    # Route Playwright through ScraperAPI's Indian gateway
     launch_args = {
         "headless": True,
-        "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        "proxy": {
+            "server": "http://proxy-server.scraperapi.com:8001",
+            "username": "scraperapi.country_code=in",
+            "password": scraperapi_key
+        },
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--ignore-certificate-errors"
+        ]
     }
-    if proxy_server:
-        launch_args["proxy"] = {"server": proxy_server}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch_args)
         context = browser.new_context(
+            ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900},
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9,kn;q=0.8",
-                "Referer": "https://judiciary.karnataka.gov.in/"
-            }
+            viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
 
-        print("[*] Navigating to High Court Portal...")
-        try:
-            # Use 'commit' to prevent hangs on stalled scripts
-            response = page.goto(
-                "https://judiciary.karnataka.gov.in/causelistSearch.php", 
-                wait_until="commit", 
-                timeout=45000
-            )
-            print(f"[*] Initial HTTP Response Status: {response.status if response else 'None'}")
-            page.wait_for_timeout(4000)
-        except Exception as e:
-            print(f"[FATAL] Could not establish connection to the court website: {e}")
-            page.screenshot(path="failure.png")
-            browser.close()
-            raise
+        print("[*] Navigating to High Court Portal via Indian Gateway...")
+        page.goto(
+            "https://judiciary.karnataka.gov.in/causelistSearch.php", 
+            wait_until="domcontentloaded", 
+            timeout=90000
+        )
+        print("[+] Portal successfully connected.")
+        page.wait_for_timeout(2000)
 
-        # Check if page actually loaded form elements
-        if not page.locator("select").first.is_visible():
-            print("[FATAL] Page loaded but cause list form elements were not found (Possible IP Block/WAF).")
-            page.screenshot(path="failure.png")
-            with open("page_dump.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-            browser.close()
-            raise RuntimeError("Court portal blocked access or failed to display the search form.")
-
-        # 1. Bench Selection
+        # 1. Bench Selection: Bengaluru Bench
         bench = page.locator("select").first
         bench.select_option(label="Bengaluru Bench")
         page.wait_for_timeout(1000)
@@ -95,7 +89,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         adv_input = page.locator("input[type='text']:visible").first
         adv_input.fill("Mahesh Chowdhary")
 
-        # 4. Dates
+        # 4. Dates (From and To)
         date_inputs = page.locator("input[placeholder*='DD/MM/YYYY'], input[name*='date'], input[id*='date']").all()
         if len(date_inputs) >= 2:
             date_inputs[0].fill(date_str)
@@ -106,7 +100,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         page.wait_for_timeout(1000)
 
-        # 5. Print List Trigger
+        # 5. Click PRINT LIST to generate printable cause list view
         print_btn = page.locator("input[value*='PRINT'], button:has-text('PRINT')").first
         
         try:
@@ -118,10 +112,9 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             target_page.pdf(path=pdf_path, format="A4", print_background=True)
             print(f"[+] Saved cause list PDF via popup to {pdf_path}")
         except Exception:
-            # Fallback if opened in same tab
             page.wait_for_timeout(2000)
             page.pdf(path=pdf_path, format="A4", print_background=True)
-            print(f"[+] Saved cause list PDF via current page to {pdf_path}")
+            print(f"[+] Saved cause list PDF to {pdf_path}")
 
         browser.close()
 
@@ -135,15 +128,18 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
-    print("[*] Submitting cause list PDF to Gemini 3.6 Flash...")
+    print("[*] Submitting cause list PDF to Gemini...")
     prompt = (
         "Extract the complete cause list table from this PDF into the structured JSON schema. "
         "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
         "If there are no cases listed or the list is empty, return an empty rows array."
     )
 
+    # Use the requested model version
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
     response = client.models.generate_content(
-        model="gemini-3.6-flash",
+        model=model_name,
         contents=[
             types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
             prompt
@@ -158,11 +154,11 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     parsed: CauseListDocument = CauseListDocument.model_validate_json(response.text)
     print(f"[+] Extracted {len(parsed.rows)} rows for date: {parsed.date}")
 
-    # Build Excel
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Cause List"
 
+    # Exact headers matching the High Court PDF
     headers = ["SL NO", "CASE NUMBER", "CASE NAME", "CH", "LIST", "SL NO", "STATUS", "JUDGES"]
     ws.append(headers)
 
