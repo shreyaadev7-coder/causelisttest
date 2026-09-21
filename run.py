@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# Define schema matching exact PDF columns
 class CauseListRow(BaseModel):
     sl_no: str = Field(description="First SL NO column")
     case_number: str = Field(description="CASE NUMBER (e.g. WP NO 102709/2026)")
@@ -34,81 +33,97 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
     date_str = get_next_day_ist()
     print(f"[*] Targeting Causelist Date (IST): {date_str}")
 
+    proxy_server = os.environ.get("PROXY_SERVER") # Optional: "http://ip:port"
+    launch_args = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    }
+    if proxy_server:
+        launch_args["proxy"] = {"server": proxy_server}
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
+        browser = p.chromium.launch(**launch_args)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900}
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9,kn;q=0.8",
+                "Referer": "https://judiciary.karnataka.gov.in/"
+            }
         )
         page = context.new_page()
 
+        print("[*] Navigating to High Court Portal...")
         try:
-            print("[*] Navigating to High Court Portal...")
-            page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
+            # Use 'commit' to prevent hangs on stalled scripts
+            response = page.goto(
+                "https://judiciary.karnataka.gov.in/causelistSearch.php", 
+                wait_until="commit", 
+                timeout=45000
+            )
+            print(f"[*] Initial HTTP Response Status: {response.status if response else 'None'}")
+            page.wait_for_timeout(4000)
+        except Exception as e:
+            print(f"[FATAL] Could not establish connection to the court website: {e}")
+            page.screenshot(path="failure.png")
+            browser.close()
+            raise
 
-            # 1. Select Bench: Bengaluru Bench
-            bench = page.locator("select").first
-            bench.select_option(label="Bengaluru Bench")
-            page.wait_for_timeout(1000)
+        # Check if page actually loaded form elements
+        if not page.locator("select").first.is_visible():
+            print("[FATAL] Page loaded but cause list form elements were not found (Possible IP Block/WAF).")
+            page.screenshot(path="failure.png")
+            with open("page_dump.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            browser.close()
+            raise RuntimeError("Court portal blocked access or failed to display the search form.")
 
-            # 2. Select Search By: Advocate
-            search_by = page.locator("select").nth(1)
-            try:
-                search_by.select_option(label="Advocate")
-            except Exception:
-                # Fallback search by text value
-                page.select_option("select:has-text('Advocate')", label="Advocate")
-            page.wait_for_timeout(1000)
+        # 1. Bench Selection
+        bench = page.locator("select").first
+        bench.select_option(label="Bengaluru Bench")
+        page.wait_for_timeout(1000)
 
-            # 3. Fill Advocate Name
-            adv_input = page.locator("input[type='text']:visible").first
-            adv_input.fill("Mahesh Chowdhary")
+        # 2. Search By: Advocate
+        search_by = page.locator("select").nth(1)
+        try:
+            search_by.select_option(label="Advocate")
+        except Exception:
+            page.select_option("select:has-text('Advocate')", label="Advocate")
+        page.wait_for_timeout(1000)
 
-            # 4. Fill Causelist Date (From and To)
-            date_inputs = page.locator("input[placeholder*='DD/MM/YYYY'], input[name*='date'], input[id*='date']").all()
-            if len(date_inputs) >= 2:
-                date_inputs[0].fill(date_str)
-                date_inputs[1].fill(date_str)
-            else:
-                for inp in page.locator("input[type='text']:visible").all()[1:]:
-                    inp.fill(date_str)
+        # 3. Advocate Name
+        adv_input = page.locator("input[type='text']:visible").first
+        adv_input.fill("Mahesh Chowdhary")
 
-            page.wait_for_timeout(1000)
+        # 4. Dates
+        date_inputs = page.locator("input[placeholder*='DD/MM/YYYY'], input[name*='date'], input[id*='date']").all()
+        if len(date_inputs) >= 2:
+            date_inputs[0].fill(date_str)
+            date_inputs[1].fill(date_str)
+        else:
+            for inp in page.locator("input[type='text']:visible").all()[1:]:
+                inp.fill(date_str)
 
-            # 5. Click PRINT LIST to generate document view
-            print_btn = page.locator("input[value*='PRINT'], button:has-text('PRINT')").first
-            
-            # Check if PRINT LIST opens a new popup tab
-            with context.expect_page(timeout=10000) as popup_info:
+        page.wait_for_timeout(1000)
+
+        # 5. Print List Trigger
+        print_btn = page.locator("input[value*='PRINT'], button:has-text('PRINT')").first
+        
+        try:
+            with context.expect_page(timeout=15000) as popup_info:
                 print_btn.click()
-            
             target_page = popup_info.value
             target_page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
-
-            # Render to PDF
             target_page.pdf(path=pdf_path, format="A4", print_background=True)
-            print(f"[+] Successfully saved cause list PDF to {pdf_path}")
+            print(f"[+] Saved cause list PDF via popup to {pdf_path}")
+        except Exception:
+            # Fallback if opened in same tab
+            page.wait_for_timeout(2000)
+            page.pdf(path=pdf_path, format="A4", print_background=True)
+            print(f"[+] Saved cause list PDF via current page to {pdf_path}")
 
-        except Exception as e:
-            # Check if results loaded on current page rather than a popup
-            print(f"[!] Popup did not appear ({e}), checking main page...")
-            try:
-                page.pdf(path=pdf_path, format="A4", print_background=True)
-                print(f"[+] Saved main page PDF to {pdf_path}")
-            except Exception as inner_err:
-                print(f"[ERROR] Failed to capture cause list: {inner_err}")
-                page.screenshot(path="failure.png", full_page=True)
-                with open("page_dump.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                raise
-
-        finally:
-            browser.close()
+        browser.close()
 
 def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -120,15 +135,15 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
-    print("[*] Submitting cause list PDF to Gemini 2.5 Flash...")
+    print("[*] Submitting cause list PDF to Gemini 3.6 Flash...")
     prompt = (
         "Extract the complete cause list table from this PDF into the structured JSON schema. "
         "Strictly preserve exact cell contents, case numbers, party names, judge titles, and status text. "
-        "If there are no cases listed, return an empty rows array."
+        "If there are no cases listed or the list is empty, return an empty rows array."
     )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=[
             types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
             prompt
