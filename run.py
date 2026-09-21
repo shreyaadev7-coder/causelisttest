@@ -27,16 +27,15 @@ class CauseListDocument(BaseModel):
     rows: list[CauseListRow]
 
 def get_target_date_ist():
-    # Priority 1: GitHub Actions manual input if provided
     manual = os.environ.get("TEST_DATE")
     if manual and manual.strip():
         print(f"[*] Overriding date with TEST_DATE: {manual.strip()}")
         return manual.strip()
 
-    # Priority 2: Hardcoded test date for verification
+    # Hardcoded test date for verification
     return "22/09/2026"
 
-    # Production logic (uncomment when testing is complete):
+    # Production logic:
     # ist = pytz.timezone('Asia/Kolkata')
     # next_day = datetime.now(ist) + timedelta(days=1)
     # return next_day.strftime("%d/%m/%Y")
@@ -73,8 +72,8 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
         )
         page = context.new_page()
 
-        # Prevent browser print dialogs from freezing headless execution
-        page.add_init_script("window.print = () => { console.log('window.print called'); };")
+        # Prevent browser print dialogs from blocking execution
+        page.add_init_script("window.print = () => { console.log('window.print intercepted'); };")
 
         print("[*] Navigating to High Court Portal via Indian Gateway...")
         page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=90000)
@@ -83,7 +82,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         # 1. Bench Selection
         print("[*] Step 1: Selecting Bench -> Bengaluru Bench")
-        bench_select = page.locator("select[name='bench']").first
+        bench_select = page.locator("select[name='bench']:visible").first
         selected_bench = False
         for opt in bench_select.locator("option").all():
             opt_text = opt.inner_text().strip()
@@ -98,7 +97,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
 
         # 2. Search By: Advocate
         print("[*] Step 2: Selecting Search By -> Advocate")
-        searchby_select = page.locator("select[name='searchby']").first
+        searchby_select = page.locator("select[name='searchby']:visible").first
         selected_search_by = False
         for opt in searchby_select.locator("option").all():
             opt_text = opt.inner_text().strip()
@@ -111,61 +110,62 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
             searchby_select.select_option(index=1)
         page.wait_for_timeout(3000)
 
-        # 3. Enter Dates using the exact field IDs from the log
+        # 3. Enter Dates (Using .first to prevent duplicate ID strict mode violations)
         print(f"[*] Step 3: Entering Date -> {date_str}")
-        from_dt = page.locator("#fromDt")
+        from_dt = page.locator("#fromDt:visible").first
         if from_dt.is_visible():
             from_dt.fill(date_str)
             print(f"[+] #fromDt set to: '{date_str}'")
 
-        to_dt = page.locator("#toDt")
+        to_dt = page.locator("#toDt:visible").first
         if to_dt.is_visible():
             to_dt.fill(date_str)
             print(f"[+] #toDt set to: '{date_str}'")
 
         page.wait_for_timeout(1000)
 
-        # 4. Enter Advocate Name using exact #advName ID
+        # 4. Enter Advocate Name (Resolves duplicate ID by targeting the specific visible placeholder)
         print("[*] Step 4: Entering Advocate Name -> Mahesh Chowdhary")
-        adv_input = page.locator("#advName")
-        if adv_input.is_visible():
-            adv_input.fill("Mahesh Chowdhary")
-            print(f"[+] #advName verified: '{adv_input.input_value()}'")
-        else:
-            # Fallback if ID changed
-            page.locator("input[placeholder*='Advocate']:visible").first.fill("Mahesh Chowdhary")
+        adv_input = page.locator("input[placeholder='Enter Advocate Name']:visible").first
+        if not adv_input.is_visible():
+            adv_input = page.locator("#advName:visible").first
+
+        adv_input.click()
+        adv_input.fill("")
+        adv_input.fill("Mahesh Chowdhary")
+        print(f"[+] Advocate Name verified in field: '{adv_input.input_value()}'")
 
         page.wait_for_timeout(1000)
         page.screenshot(path="01_form_filled.png")
         print("[*] Saved screenshot: 01_form_filled.png")
 
-        # 5. Click GET DETAILS using exact #getData ID
+        # 5. Click GET DETAILS
         print("[*] Step 5: Submitting search via '#getData'...")
-        page.locator("#getData").click()
+        get_data_btn = page.locator("#getData:visible").first
+        get_data_btn.click()
 
-        print("[*] Waiting 6 seconds for database results...")
-        page.wait_for_timeout(6000)
+        print("[*] Waiting 7 seconds for court database query to complete...")
+        page.wait_for_timeout(7000)
         page.screenshot(path="02_search_results.png")
         print("[*] Saved screenshot: 02_search_results.png")
 
-        # 6. Locate Print Button without invalid CSS syntax
-        print("[*] Step 6: Locating Print Button...")
+        # 6. Locate Print Button or Print View
+        print("[*] Step 6: Triggering Print List...")
         print_btn = None
-        for btn in page.locator("input[type='button']:visible, button:visible").all():
+        for btn in page.locator("input[type='button']:visible, button:visible, a:visible").all():
             btn_id = (btn.get_attribute("id") or "").lower()
             val = (btn.get_attribute("value") or "").lower()
             txt = (btn.inner_text() or "").lower()
             if btn_id == "getdata":
                 continue
-            print(f"    Button found: id='{btn_id}', value='{val}', text='{txt}'")
             if "print" in val or "print" in txt or "print" in btn_id:
                 print_btn = btn
+                print(f"[+] Identified Print Button: id='{btn_id}', val='{val}', txt='{txt}'")
                 break
 
         if print_btn:
-            print("[+] Clicking Print button...")
             try:
-                with context.expect_page(timeout=6000) as popup_info:
+                with context.expect_page(timeout=8000) as popup_info:
                     print_btn.click()
                 print_page = popup_info.value
                 print_page.wait_for_load_state("domcontentloaded")
@@ -180,7 +180,7 @@ def fetch_cause_list_pdf(pdf_path="causelist.pdf"):
                 page.screenshot(path="03_print_view.png")
                 print(f"[+] Saved cause list PDF from page: {pdf_path}")
         else:
-            print("[*] Rendering table directly to PDF...")
+            print("[*] No separate print button found; rendering results table directly to PDF...")
             page.pdf(path=pdf_path, format="A4", print_background=True)
             page.screenshot(path="03_print_view.png")
 
@@ -239,7 +239,7 @@ def parse_pdf_to_excel(pdf_path="causelist.pdf", excel_path="cause_list.xlsx"):
     ws = wb.active
     ws.title = "Cause List"
 
-    # Exact headers matching the High Court PDF
+    # Exact 8 headers matching the High Court PDF
     headers = ["SL NO", "CASE NUMBER", "CASE NAME", "CH", "LIST", "SL NO", "STATUS", "JUDGES"]
     ws.append(headers)
 
