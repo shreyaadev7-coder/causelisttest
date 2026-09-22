@@ -14,6 +14,18 @@ from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.cell.rich_text import TextBlock, CellRichText
 from openpyxl.cell.text import InlineFont
 
+# List of advocates to query
+ADVOCATES = [
+    "Mahesh Chowdhary",
+    "Nagaraja Naidu",
+    "Abhimanyu",
+    "Krishika Vaishnav",
+    "Shahbaaz Hussain"
+]
+
+# Regex pattern matching any of our tracked advocates
+ADVOCATE_REGEX = r'\b(MAHESH|CHOWDHA?R[YI]|NAGARAJA?|NAIDU|ABHIMANYU|KRISHIKA|VAISHNAV|SHAHBAAZ|HUSSAIN)\b'
+
 class CauseListRow(BaseModel):
     sl_no: str = Field(description="Serial number")
     case_number: str = Field(description="Case number like WP NO 102709/2026")
@@ -36,18 +48,14 @@ def get_target_date_ist():
 
 def clean_party_string(s: str) -> str:
     """Strips out prefixes, advocate names, and procedural notes."""
-    # Strip leading PET:, RES:, etc.
     s = re.sub(r'^(?:PET|RES|PETITIONER|RESPONDENT|APPELLANT|COMPLAINANT)\s*:\s*', '', s, flags=re.I)
-    # Strip procedural notes in parentheses
     s = re.sub(r'\([^\)]*\)', '', s)
-    # Cut off at ADV: or ADVOCATE:
     adv_split = re.split(r'\b(?:ADV|ADVOCATE|ADVOCATES|COUNSEL)\s*[:.]?\s*', s, flags=re.I)
     s = adv_split[0]
-    # Filter out comma-separated lawyer tokens
     chunks = [c.strip() for c in re.split(r'[,;]', s) if c.strip()]
     valid = []
     for c in chunks:
-        if not re.search(r'\b(MAHESH|CHOWDHA?R[YI]|AGA|HCGP|ADV|ADVOCATE|ADVOCATES|COUNSEL|FOR\s+RES|FOR\s+PET|GOVT|PLEADER)\b', c, re.I):
+        if not re.search(rf'({ADVOCATE_REGEX}|AGA|HCGP|ADV|ADVOCATE|ADVOCATES|COUNSEL|FOR\s+RES|FOR\s+PET|GOVT|PLEADER)', c, re.I):
             valid.append(c)
     res = ", ".join(valid) if valid else (chunks[0] if chunks else s)
     return res.strip(" ,;:-")
@@ -55,7 +63,7 @@ def clean_party_string(s: str) -> str:
 def clean_case_details(raw_name: str):
     """
     Splits case text into Petitioner and Respondent,
-    and identifies which side Mahesh Chowdhary represents.
+    and identifies which side our advocate team represents.
     """
     text = re.sub(r'[\r\n]+', ' ', raw_name)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -73,8 +81,12 @@ def clean_case_details(raw_name: str):
         pet_block = text
         res_block = ""
 
-    # Detect which side Mahesh Chowdhary represents
-    if re.search(r'\b(MAHESH|CHOWDHA?R[YI])\b', res_block, re.I):
+    # Detect if respondent side contains any of our advocates
+    if re.search(ADVOCATE_REGEX, res_block, re.I):
+        in_charge = "RES"
+    elif re.search(ADVOCATE_REGEX, pet_block, re.I):
+        in_charge = "PET"
+    elif bool(re.search(r'\b(RESPONDENT|RES)\b.*?\b(NO|NOS|R\d+|\d+)\b', text, re.I)):
         in_charge = "RES"
     else:
         in_charge = "PET"
@@ -84,102 +96,77 @@ def clean_case_details(raw_name: str):
 
     return pet_clean, res_clean, in_charge
 
-def fetch_court_pdf(pdf_path="causelist.pdf"):
-    date_str = get_target_date_ist()
-    print(f"[*] Target Causelist Date: {date_str}")
+def fetch_advocate_pdf(page, context, date_str: str, advocate_name: str, pdf_path: str) -> bool:
+    """Navigates to the portal, searches for a single advocate, and saves the PDF."""
+    print(f"\n[*] Searching for Advocate: '{advocate_name}' for date {date_str}...")
 
-    scraperapi_key = os.environ.get("SCRAPERAPI_KEY")
-    if not scraperapi_key:
-        raise ValueError("SCRAPERAPI_KEY is missing from GitHub Secrets.")
+    page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_timeout(3000)
 
-    launch_args = {
-        "headless": True,
-        "proxy": {
-            "server": "http://proxy-server.scraperapi.com:8001",
-            "username": "scraperapi.country_code=in",
-            "password": scraperapi_key
-        },
-        "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"]
-    }
+    # 1. Bench Selection
+    bench_select = page.locator("select[name='bench']:visible").first
+    for opt in bench_select.locator("option").all():
+        opt_text = opt.inner_text().strip()
+        if "Bengaluru" in opt_text or "Bangalore" in opt_text or "Principal" in opt_text:
+            bench_select.select_option(label=opt_text)
+            break
+    page.wait_for_timeout(2000)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_args)
-        context = browser.new_context(
-            ignore_https_errors=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            viewport={"width": 1366, "height": 900}
-        )
-        page = context.new_page()
-        page.add_init_script("window.print = () => { console.log('print intercepted'); };")
+    # 2. Search By: Advocate
+    searchby_select = page.locator("select[name='searchby']:visible").first
+    for opt in searchby_select.locator("option").all():
+        if "Advocate" in opt.inner_text().strip():
+            searchby_select.select_option(label=opt.inner_text().strip())
+            break
+    page.wait_for_timeout(3000)
 
-        print("[*] Navigating to High Court Portal via Indian Gateway...")
-        page.goto("https://judiciary.karnataka.gov.in/causelistSearch.php", wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3000)
+    # 3. Enter Dates
+    page.locator("#fromDt:visible").first.fill(date_str)
+    page.locator("#toDt:visible").first.fill(date_str)
+    page.wait_for_timeout(1000)
 
-        # 1. Bench Selection
-        bench_select = page.locator("select[name='bench']:visible").first
-        for opt in bench_select.locator("option").all():
-            opt_text = opt.inner_text().strip()
-            if "Bengaluru" in opt_text or "Bangalore" in opt_text or "Principal" in opt_text:
-                bench_select.select_option(label=opt_text)
-                break
-        page.wait_for_timeout(2000)
+    # 4. Enter Advocate Name
+    adv_input = page.locator("input[placeholder='Enter Advocate Name']:visible").first
+    if not adv_input.is_visible():
+        adv_input = page.locator("#advName:visible").first
+    adv_input.click()
+    adv_input.fill("")
+    adv_input.fill(advocate_name)
+    page.wait_for_timeout(1000)
 
-        # 2. Search By: Advocate
-        searchby_select = page.locator("select[name='searchby']:visible").first
-        for opt in searchby_select.locator("option").all():
-            if "Advocate" in opt.inner_text().strip():
-                searchby_select.select_option(label=opt.inner_text().strip())
-                break
-        page.wait_for_timeout(3000)
+    # 5. Click GET DETAILS
+    page.locator("#getData:visible").first.click()
+    print(f"[*] Waiting for search results for {advocate_name}...")
+    page.wait_for_timeout(7000)
 
-        # 3. Enter Dates
-        page.locator("#fromDt:visible").first.fill(date_str)
-        page.locator("#toDt:visible").first.fill(date_str)
-        page.wait_for_timeout(1000)
+    # 6. Click Print Button
+    print_btn = None
+    for btn in page.locator("input[type='button']:visible, button:visible").all():
+        val = (btn.get_attribute("value") or "").lower()
+        txt = (btn.inner_text() or "").lower()
+        if btn.get_attribute("id") == "getData":
+            continue
+        if "print" in val or "print" in txt:
+            print_btn = btn
+            break
 
-        # 4. Enter Advocate Name
-        adv_input = page.locator("input[placeholder='Enter Advocate Name']:visible").first
-        if not adv_input.is_visible():
-            adv_input = page.locator("#advName:visible").first
-        adv_input.click()
-        adv_input.fill("")
-        adv_input.fill("Mahesh Chowdhary")
-        page.wait_for_timeout(1000)
+    target_page = page
+    if print_btn:
+        try:
+            with context.expect_page(timeout=8000) as popup_info:
+                print_btn.click()
+            target_page = popup_info.value
+            target_page.wait_for_load_state("domcontentloaded")
+            target_page.wait_for_timeout(3000)
+        except Exception:
+            target_page = page
 
-        # 5. Click GET DETAILS
-        page.locator("#getData:visible").first.click()
-        print("[*] Waiting for search results...")
-        page.wait_for_timeout(7000)
+    target_page.pdf(path=pdf_path, format="A4", print_background=True)
+    print(f"[+] Downloaded court PDF for {advocate_name} to {pdf_path}")
+    return True
 
-        # 6. Click Print Button
-        print_btn = None
-        for btn in page.locator("input[type='button']:visible, button:visible").all():
-            val = (btn.get_attribute("value") or "").lower()
-            txt = (btn.inner_text() or "").lower()
-            if btn.get_attribute("id") == "getData":
-                continue
-            if "print" in val or "print" in txt:
-                print_btn = btn
-                break
-
-        target_page = page
-        if print_btn:
-            try:
-                with context.expect_page(timeout=8000) as popup_info:
-                    print_btn.click()
-                target_page = popup_info.value
-                target_page.wait_for_load_state("domcontentloaded")
-                target_page.wait_for_timeout(3000)
-            except Exception:
-                target_page = page
-
-        target_page.pdf(path=pdf_path, format="A4", print_background=True)
-        print(f"[+] Downloaded court PDF to {pdf_path}")
-        browser.close()
-
-def parse_pdf_with_gemini(pdf_path="causelist.pdf"):
-    """Uses Gemini to parse actual case rows, ignoring banner notices."""
+def parse_pdf_with_gemini(pdf_path: str) -> list[CauseListRow]:
+    """Uses Gemini to parse case rows from the advocate's PDF."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY is missing.")
@@ -200,7 +187,7 @@ def parse_pdf_with_gemini(pdf_path="causelist.pdf"):
 
     for model_name in models:
         try:
-            print(f"[*] Submitting PDF to {model_name}...")
+            print(f"[*] Submitting {pdf_path} to {model_name}...")
             response = client.models.generate_content(
                 model=model_name,
                 contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
@@ -211,14 +198,14 @@ def parse_pdf_with_gemini(pdf_path="causelist.pdf"):
                 )
             )
             parsed = CauseListDocument.model_validate_json(response.text)
-            print(f"[+] Successfully extracted {len(parsed.rows)} case records via {model_name}.")
+            print(f"[+] Extracted {len(parsed.rows)} case records via {model_name}.")
             break
         except Exception as e:
             print(f"[!] {model_name} unavailable ({e}), trying next model...")
             time.sleep(2)
 
     if not parsed:
-        raise RuntimeError("Unable to extract records from Gemini API.")
+        return []
     return parsed.rows
 
 def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
@@ -266,10 +253,9 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
         ])
 
         curr_row = idx + 1
-        # Set row height to 45 so cells do not collapse
         ws.row_dimensions[curr_row].height = 45
 
-        # 3. Bold only Mahesh Chowdhary's party
+        # 3. Bold only the represented party
         case_cell = ws.cell(row=curr_row, column=3)
         try:
             if in_charge == "PET":
@@ -294,7 +280,6 @@ def write_to_excel(rows: list, excel_path="cause_list.xlsx"):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(name="Calibri", size=10, bold=False)
             elif c == 2:
-                # Case number in bold
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(name="Calibri", size=10, bold=True)
             elif c == 3:
@@ -334,6 +319,8 @@ def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
         </tr>
         """
 
+    advocates_header = ", ".join(ADVOCATES)
+
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -358,7 +345,7 @@ def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
                 <div>Daily Cause List &bull; Date: {date_str}</div>
             </div>
             <div style="text-align: right;">
-                <div style="font-weight: bold;">ADVOCATE: MAHESH CHOWDHARY</div>
+                <div style="font-weight: bold; font-size: 10px;">ADVOCATES: {advocates_header}</div>
                 <div>Total Matters: {len(rows)}</div>
             </div>
         </div>
@@ -409,13 +396,61 @@ def generate_pdf(rows: list, date_str: str, pdf_path="cause_list.pdf"):
 
 if __name__ == "__main__":
     try:
-        fetch_court_pdf("causelist.pdf")
-        target_date = get_target_date_ist()
-        rows = parse_pdf_with_gemini("causelist.pdf")
-        
-        write_to_excel(rows, "cause_list.xlsx")
-        generate_pdf(rows, target_date, "cause_list.pdf")
-        print("[+] Done! Both cause_list.xlsx and cause_list.pdf generated successfully.")
+        date_str = get_target_date_ist()
+        print(f"[*] Target Causelist Date: {date_str}")
+
+        scraperapi_key = os.environ.get("SCRAPERAPI_KEY")
+        if not scraperapi_key:
+            raise ValueError("SCRAPERAPI_KEY is missing from GitHub Secrets.")
+
+        launch_args = {
+            "headless": True,
+            "proxy": {
+                "server": "http://proxy-server.scraperapi.com:8001",
+                "username": "scraperapi.country_code=in",
+                "password": scraperapi_key
+            },
+            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"]
+        }
+
+        all_cases = []
+        seen_case_numbers = set()
+
+        # Iterate through all advocates in a single browser session
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**launch_args)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 900}
+            )
+            page = context.new_page()
+            page.add_init_script("window.print = () => { console.log('print intercepted'); };")
+
+            for idx, advocate in enumerate(ADVOCATES, start=1):
+                temp_pdf = f"causelist_{idx}.pdf"
+                try:
+                    fetch_advocate_pdf(page, context, date_str, advocate, temp_pdf)
+                    parsed_rows = parse_pdf_with_gemini(temp_pdf)
+                    for r in parsed_rows:
+                        c_num = r.case_number.strip().upper()
+                        # Deduplicate in case multiple advocates appear in the same matter
+                        if c_num and c_num not in seen_case_numbers:
+                            seen_case_numbers.add(c_num)
+                            all_cases.append(r)
+                        elif not c_num:
+                            all_cases.append(r)
+                except Exception as e:
+                    print(f"[!] Error fetching for advocate '{advocate}': {e}")
+                    traceback.print_exc()
+
+            browser.close()
+
+        print(f"\n[+] Total unique cases compiled across all advocates: {len(all_cases)}")
+        write_to_excel(all_cases, "cause_list.xlsx")
+        generate_pdf(all_cases, date_str, "cause_list.pdf")
+        print("[+] Done! All advocate matters combined into cause_list.xlsx and cause_list.pdf.")
+
     except Exception as err:
         print(f"[FATAL] Process aborted: {err}", file=sys.stderr)
         traceback.print_exc()
