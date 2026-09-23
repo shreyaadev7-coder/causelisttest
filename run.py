@@ -32,7 +32,7 @@ def get_target_date_ist():
     manual = os.environ.get("TEST_DATE")
     if manual and manual.strip():
         return manual.strip()
-    return "24/09/2026"
+    return "22/09/2026"
 
 def clean_party_string(s: str) -> str:
     """Strips out prefixes, advocate names, and procedural notes."""
